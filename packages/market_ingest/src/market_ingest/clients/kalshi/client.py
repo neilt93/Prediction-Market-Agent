@@ -52,22 +52,27 @@ class KalshiClient(BaseHttpClient):
     def _full_path(self, path: str) -> str:
         """Get the full URL path for signing."""
         parsed = urlparse(self.base_url)
-        return f"{parsed.path}/{path.lstrip('/')}"
+        base = parsed.path.rstrip("/")
+        return f"{base}/{path.lstrip('/')}"
+
+    async def _auth_request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        """Make an authenticated request — signs AFTER rate limiting."""
+        await self.rate_limiter.acquire()
+        client = await self._get_client()
+        full_path = self._full_path(path)
+        headers = self._auth_headers(method, full_path)
+        resp = await client.request(method, path, headers=headers, **kwargs)
+        resp.raise_for_status()
+        return resp.json()
 
     async def _auth_get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        full_path = self._full_path(path)
-        headers = self._auth_headers("GET", full_path)
-        return await self.get(path, params=params, headers=headers)
+        return await self._auth_request("GET", path, params=params)
 
     async def _auth_post(self, path: str, json: dict[str, Any] | None = None) -> dict[str, Any]:
-        full_path = self._full_path(path)
-        headers = self._auth_headers("POST", full_path)
-        return await self.post(path, json=json, headers=headers)
+        return await self._auth_request("POST", path, json=json)
 
     async def _auth_delete(self, path: str) -> dict[str, Any]:
-        full_path = self._full_path(path)
-        headers = self._auth_headers("DELETE", full_path)
-        return await self.delete(path, headers=headers)
+        return await self._auth_request("DELETE", path)
 
     # --- Market Discovery ---
 

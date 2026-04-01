@@ -17,3 +17,8 @@ class BaseAppSettings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     debug: bool = False
     log_level: str = "INFO"
+
+    # Kalshi
+    kalshi_env: str = "demo"
+    kalshi_api_key_id: str = ""
+    kalshi_private_key_path: str = ""
