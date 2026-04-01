@@ -1,26 +1,28 @@
 """Backtest the agent on historical resolved Polymarket markets.
 
-1. Fetch resolved events from Polymarket (known outcomes)
-2. For each market, reconstruct the state BEFORE resolution
-3. Run the forecaster as if we didn't know the outcome
-4. Compare forecast vs actual outcome
-5. Generate postmortems with Brier scores
-6. Retrain the calibrator on accumulated data
-7. Print a performance report
+Full pipeline:
+1. Fetch hundreds of resolved events with known outcomes
+2. For each market, reconstruct pre-resolution state
+3. Gather evidence (news, crypto prices, Wikipedia)
+4. Run LLM forecaster with evidence
+5. Score against actual outcomes
+6. Generate postmortems with error classification
+7. Retrain calibrator on accumulated data
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import math
 import sys
+import random
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from collections import Counter
 
-# Add package paths
-for pkg in ["shared", "schemas", "market_ingest", "rules", "forecasting", "calibration", "execution", "training"]:
+for pkg in ["shared", "schemas", "market_ingest", "rules", "forecasting",
+            "calibration", "execution", "training", "evidence"]:
     sys.path.insert(0, str(Path(__file__).parent / "packages" / pkg / "src"))
 
 from shared.config import BaseAppSettings
@@ -38,8 +40,9 @@ def get_db():
     return factory()
 
 
-async def fetch_resolved_markets(session, max_events: int = 100):
-    """Fetch resolved Polymarket events with known outcomes."""
+# ─── STEP 1: Ingest resolved markets ───────────────────────────────────────
+
+async def fetch_resolved_markets(session, max_pages: int = 5):
     from market_ingest.clients.polymarket.gamma_client import GammaClient
     from market_ingest.clients.polymarket.clob_client import ClobClient
     from market_ingest.mappers.polymarket_mapper import PolymarketMapper
@@ -51,33 +54,23 @@ async def fetch_resolved_markets(session, max_events: int = 100):
     ingested = 0
 
     try:
-        # Fetch resolved events across multiple pages for diversity
-        offset = 0
         all_events = []
-        pages_fetched = 0
-        while len(all_events) < max_events and pages_fetched < 5:
+        for page in range(max_pages):
             events = await gamma.list_events(
-                closed=True, limit=100, offset=offset, order="volume", ascending=False,
+                closed=True, limit=100, offset=page * 100,
+                order="volume", ascending=False,
             )
             if not events:
                 break
             all_events.extend(events)
-            offset += 100
-            pages_fetched += 1
+        logger.info(f"Fetched {len(all_events)} resolved events across {max_pages} pages")
 
-        logger.info(f"Fetched {len(all_events)} resolved events")
-
-        for event in all_events[:max_events]:
+        for event in all_events:
             if not event.markets:
                 continue
-
             for pm in event.markets:
-                if not pm.enable_order_book:
+                if not pm.enable_order_book or not (pm.closed or pm.archived):
                     continue
-                if not (pm.closed or pm.archived):
-                    continue
-
-                # Determine outcome
                 outcome_data = mapper.market_to_outcome(pm)
                 if not outcome_data or outcome_data["resolved_label"] is None:
                     continue
@@ -91,7 +84,6 @@ async def fetch_resolved_markets(session, max_events: int = 100):
                 if existing:
                     continue
 
-                # Create market record
                 market_data = mapper.market_to_db(pm, event)
                 market_data["status"] = "resolved"
                 market_data["metadata_json"] = {
@@ -103,79 +95,69 @@ async def fetch_resolved_markets(session, max_events: int = 100):
                 session.add(market)
                 session.flush()
 
-                # Store outcome
                 outcome_data["market_id"] = market.id
                 session.add(MarketOutcome(**outcome_data))
 
-                # Try to get historical price for a synthetic "pre-resolution" snapshot
+                # Get price history for synthetic pre-resolution snapshot
                 if pm.clob_token_ids:
                     try:
                         history = await clob.get_prices_history(
                             pm.clob_token_ids[0], interval="max", fidelity=60,
                         )
                         if history and len(history) > 10:
-                            # Use a price from ~75% through the market's life
-                            # This simulates having seen most evidence but not the final outcome
-                            idx = int(len(history) * 0.75)
-                            mid_point = history[idx]
-                            # Also grab some earlier points for context
-                            early_point = history[int(len(history) * 0.25)]
-
+                            idx = int(len(history) * 0.6)  # 60% through = before final convergence
+                            pt = history[idx]
                             snap = MarketSnapshot(
                                 market_id=market.id,
-                                ts=datetime.fromtimestamp(mid_point.t, tz=timezone.utc),
-                                mid_yes=Decimal(str(round(mid_point.p, 6))),
-                                last_yes=Decimal(str(round(mid_point.p, 6))),
-                                best_bid_yes=Decimal(str(round(max(0.01, mid_point.p - 0.02), 6))),
-                                best_ask_yes=Decimal(str(round(min(0.99, mid_point.p + 0.02), 6))),
-                                spread_bps=400,  # Synthetic 4-cent spread
+                                ts=datetime.fromtimestamp(pt.t, tz=timezone.utc),
+                                mid_yes=Decimal(str(round(pt.p, 6))),
+                                last_yes=Decimal(str(round(pt.p, 6))),
+                                best_bid_yes=Decimal(str(round(max(0.01, pt.p - 0.02), 6))),
+                                best_ask_yes=Decimal(str(round(min(0.99, pt.p + 0.02), 6))),
+                                spread_bps=400,
                                 liquidity_proxy=Decimal("100"),
                                 orderbook_imbalance=Decimal("0.5"),
                             )
                             session.add(snap)
-                    except Exception as e:
-                        logger.debug(f"Price history unavailable for {cid}: {e}")
+                    except Exception:
+                        pass
 
                 ingested += 1
-                if ingested % 25 == 0:
+                if ingested % 50 == 0:
                     session.commit()
-                    logger.info(f"Ingested {ingested} resolved markets...")
+                    logger.info(f"  ...ingested {ingested} resolved markets")
 
         session.commit()
         logger.info(f"Total resolved markets ingested: {ingested}")
     finally:
         await gamma.close()
         await clob.close()
-
     return ingested
 
 
-async def run_backtest_forecasts(session):
-    """Run the forecaster on resolved markets and score against outcomes."""
+# ─── STEP 2: Backtest with evidence ────────────────────────────────────────
+
+async def run_backtest(session, max_markets: int = 50):
     from forecasting.forecaster import Forecaster
     from calibration.calibrator import Calibrator
     from execution.policy import ExecutionPolicy, PolicyConfig
     from rules.parser import RuleParser
+    from evidence.retriever import EvidenceRetriever
     from schemas.models.market import Market, MarketSnapshot, MarketOutcome
     from schemas.models.forecast import Forecast, ForecastFeature, CalibratedForecast
     from schemas.models.postmortem import Postmortem
+    from sqlalchemy import exists
 
     rule_parser = RuleParser()
     calibrator = Calibrator(model_path="data/models/calibrator_latest.lgb")
-    forecaster = Forecaster(
-        api_url="http://localhost:11434/v1",
-        model="llama3.1:8b",
-    )
+    forecaster = Forecaster(api_url="http://localhost:11434/v1", model="llama3.1:8b")
+    evidence = EvidenceRetriever()
     policy = ExecutionPolicy(PolicyConfig(
-        min_edge_bps=300,
-        min_confidence=0.3,
-        max_spread_bps=15000,
-        max_position_per_market=3,
+        min_edge_bps=300, min_confidence=0.3, max_spread_bps=15000,
+        max_position_per_market=3, daily_max_loss=50.0,
     ))
 
-    # Get resolved markets with snapshots and outcomes (only those with price history)
-    from sqlalchemy import exists
-    import random
+    # Get diverse resolved markets with price history
     all_candidates = (
         session.query(Market, MarketOutcome)
         .join(MarketOutcome, MarketOutcome.market_id == Market.id)
@@ -187,34 +169,31 @@ async def run_backtest_forecasts(session):
         .all()
     )
 
-    # Diversify: pick at most 5 markets per event/subtitle, shuffle for variety
-    seen_subtitles: dict[str, int] = {}
+    # Diversify — max 3 per event subtitle
+    seen: dict[str, int] = {}
     diverse = []
     random.shuffle(all_candidates)
     for m, o in all_candidates:
-        key = m.subtitle or m.title[:30]
-        seen_subtitles[key] = seen_subtitles.get(key, 0) + 1
-        if seen_subtitles[key] <= 5:
+        key = (m.subtitle or "")[:40]
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] <= 3:
             diverse.append((m, o))
-    markets_with_outcomes = diverse[:50]
+    candidates = diverse[:max_markets]
 
-    logger.info(f"Backtesting on {len(markets_with_outcomes)} diverse resolved markets (from {len(all_candidates)} total)")
+    logger.info(f"Backtesting {len(candidates)} markets (from {len(all_candidates)} with price history)")
 
     results = []
-    for market, outcome in markets_with_outcomes:
-        # Skip if already forecasted
-        existing_forecast = session.query(Forecast).filter(Forecast.market_id == market.id).first()
-        if existing_forecast:
+    for i, (market, outcome) in enumerate(candidates):
+        # Skip already forecasted
+        if session.query(Forecast).filter(Forecast.market_id == market.id).first():
             continue
 
-        # Get snapshot (our "pre-resolution" view)
         snapshot = (
             session.query(MarketSnapshot)
             .filter(MarketSnapshot.market_id == market.id)
             .order_by(MarketSnapshot.ts.desc())
             .first()
         )
-
         market_price = float(snapshot.mid_yes) if snapshot and snapshot.mid_yes else None
         spread_bps = snapshot.spread_bps if snapshot else None
         liquidity = float(snapshot.liquidity_proxy) if snapshot and snapshot.liquidity_proxy else None
@@ -223,11 +202,19 @@ async def run_backtest_forecasts(session):
         # Parse rules
         parsed = rule_parser.parse(market.title, market.rules_text)
 
-        # Forecast — the LLM sees market title, rules, market price, but NOT the outcome
+        # Gather evidence
+        bundle = await evidence.gather(
+            title=market.title,
+            entity=parsed.entity,
+            category=market.category,
+        )
+
+        # Forecast with evidence
         forecast_output = await forecaster.forecast(
             title=market.title,
             rules_text=market.rules_text,
             parsed_rules=parsed.model_dump(),
+            evidence_snippets=bundle.top_snippets(8),
             market_price=market_price,
             time_to_close_hours=time_to_close / 3600 if time_to_close else None,
         )
@@ -240,23 +227,23 @@ async def run_backtest_forecasts(session):
             raw_probability=Decimal(str(round(forecast_output.raw_probability, 6))),
             confidence=Decimal(str(round(forecast_output.confidence, 6))),
             abstain_flag=forecast_output.abstain,
-            reasoning_summary=forecast_output.reasoning_summary,
+            reasoning_summary=forecast_output.reasoning_summary[:500] if forecast_output.reasoning_summary else None,
         )
         session.add(forecast)
         session.flush()
 
-        # Store features
+        # Features
         features = {
             "market_price": market_price or 0.5,
             "spread_bps": spread_bps or 0,
             "vol_24h": 0,
             "time_to_close_sec": time_to_close or 0,
             "ambiguity_score": parsed.ambiguity_score,
-            "freshness_score": 0.5,
+            "freshness_score": min(1.0, bundle.count / 10),
             "source_agreement_score": 0.5,
             "official_source_present": 1.0 if parsed.source_of_truth else 0.0,
             "llm_confidence": forecast_output.confidence,
-            "retrieval_count": 0,
+            "retrieval_count": bundle.count,
             "price_momentum_1h": 0.0,
             "price_momentum_24h": 0.0,
             "raw_probability": forecast_output.raw_probability,
@@ -265,61 +252,52 @@ async def run_backtest_forecasts(session):
         session.add(ForecastFeature(forecast_id=forecast.id, **feat_cols))
 
         # Calibrate
-        cal_output = calibrator.predict(features, market_price=market_price)
+        cal = calibrator.predict(features, market_price=market_price)
         session.add(CalibratedForecast(
             forecast_id=forecast.id,
             calibrator_version=calibrator.version,
-            calibrated_probability=Decimal(str(round(cal_output.calibrated_probability, 6))),
-            predicted_edge_bps=cal_output.predicted_edge_bps,
-            uncertainty_low=Decimal(str(round(cal_output.uncertainty_low, 6))),
-            uncertainty_high=Decimal(str(round(cal_output.uncertainty_high, 6))),
+            calibrated_probability=Decimal(str(round(cal.calibrated_probability, 6))),
+            predicted_edge_bps=cal.predicted_edge_bps,
+            uncertainty_low=Decimal(str(round(cal.uncertainty_low, 6))),
+            uncertainty_high=Decimal(str(round(cal.uncertainty_high, 6))),
         ))
 
-        # Score against reality
+        # Score
         label = outcome.resolved_label
         prob = forecast_output.raw_probability
         brier = (prob - label) ** 2
         eps = 1e-7
-        log_loss_val = -(label * math.log(prob + eps) + (1 - label) * math.log(1 - prob + eps))
+        ll = -(label * math.log(prob + eps) + (1 - label) * math.log(1 - prob + eps))
 
-        # Would-have-traded analysis
+        # Would-have-traded
         decision = policy.evaluate(
-            calibrated_probability=cal_output.calibrated_probability,
+            calibrated_probability=cal.calibrated_probability,
             market_price=market_price or 0.5,
             confidence=forecast_output.confidence,
             ambiguity_score=parsed.ambiguity_score,
-            spread_bps=spread_bps,
-            liquidity=liquidity,
+            spread_bps=spread_bps, liquidity=liquidity,
             abstain_flag=forecast_output.abstain,
         )
-
-        # Compute hypothetical PnL if we'd traded
         hyp_pnl = None
         if decision.should_trade and market_price is not None:
             if decision.side == "buy_yes":
-                # Bought YES at market_price, settled at label (0 or 1)
                 hyp_pnl = round((label - market_price) * decision.quantity, 4)
             else:
-                # Bought NO at (1 - market_price), settled at (1 - label)
                 hyp_pnl = round(((1 - label) - (1 - market_price)) * decision.quantity, 4)
 
-        # Classify error
         error_bucket = _classify_error(prob, label, forecast_output.confidence, parsed.ambiguity_score)
 
-        # Store postmortem
         session.add(Postmortem(
-            forecast_id=forecast.id,
-            market_id=market.id,
+            forecast_id=forecast.id, market_id=market.id,
             resolved_label=label,
             brier=Decimal(str(round(brier, 6))),
-            log_loss=Decimal(str(round(log_loss_val, 6))),
+            log_loss=Decimal(str(round(ll, 6))),
             trading_pnl=Decimal(str(hyp_pnl)) if hyp_pnl is not None else None,
             error_bucket=error_bucket,
-            human_reviewed=False,
-            training_weight=Decimal("1.0"),
+            human_reviewed=False, training_weight=Decimal("1.0"),
         ))
 
-        result = {
+        results.append({
             "title": market.title[:60],
             "market_price": market_price,
             "forecast": round(prob, 3),
@@ -329,125 +307,136 @@ async def run_backtest_forecasts(session):
             "trade_side": decision.side if decision.should_trade else None,
             "hyp_pnl": hyp_pnl,
             "error_bucket": error_bucket,
-        }
-        results.append(result)
+            "evidence_count": bundle.count,
+        })
 
-        direction = "OK" if (prob > 0.5 and label == 1) or (prob < 0.5 and label == 0) else "XX"
+        ok = "OK" if (prob > 0.5 and label == 1) or (prob < 0.5 and label == 0) else "XX"
         pnl_str = f"  PnL: ${hyp_pnl:+.2f}" if hyp_pnl is not None else ""
+        evid = f"[{bundle.count} sources]"
         logger.info(
-            f"{direction} {market.title[:55]:55s} | "
-            f"forecast={prob:.2f} actual={label} brier={brier:.3f}{pnl_str}"
+            f"  {ok} {market.title[:50]:50s} | "
+            f"p={prob:.2f} actual={label} brier={brier:.3f} {evid}{pnl_str}"
         )
+
+        if (i + 1) % 10 == 0:
+            session.commit()
 
     session.commit()
     await forecaster.close()
+    await evidence.close()
     return results
 
 
 def _classify_error(prob: float, label: int, confidence: float, ambiguity: float) -> str | None:
-    """Classify the type of error for learning."""
     error = abs(prob - label)
     if error < 0.15:
-        return None  # Good forecast
-
-    wrong_direction = (prob > 0.5 and label == 0) or (prob < 0.5 and label == 1)
-
-    if confidence > 0.7 and wrong_direction:
-        return "bad_calibration"
+        return None
+    wrong = (prob > 0.5 and label == 0) or (prob < 0.5 and label == 1)
     if ambiguity > 0.3:
         return "ambiguous_should_have_abstained"
-    if error > 0.4:
+    if confidence > 0.7 and wrong:
+        return "bad_calibration"
+    if error > 0.4 and wrong:
         return "missed_official_source"
-    return "bad_calibration"
+    if error > 0.3:
+        return "bad_calibration"
+    return "stale_evidence"
 
+
+# ─── STEP 3: Retrain calibrator ────────────────────────────────────────────
 
 def retrain_calibrator(session):
-    """Retrain the calibrator using backtest postmortems."""
     from training.trainer import CalibrationTrainer
-
     trainer = CalibrationTrainer(session)
     features_df, labels = trainer.build_training_dataset()
 
     if len(features_df) < 10:
-        logger.warning(f"Only {len(features_df)} samples — need more data for meaningful training")
-        if len(features_df) >= 5:
-            logger.info("Training anyway with small dataset for demo...")
-        else:
-            return None
+        logger.warning(f"Only {len(features_df)} samples for training")
+        return None
 
+    Path("data/models").mkdir(parents=True, exist_ok=True)
     result = trainer.retrain(save_path="data/models/calibrator_latest.lgb")
-    logger.info(f"Calibrator retrained: {result}")
-
     mistakes = trainer.get_mistake_summary()
-    if mistakes:
-        logger.info(f"Mistake breakdown: {mistakes}")
+    return result, mistakes
 
-    return result
 
+# ─── STEP 4: Report ────────────────────────────────────────────────────────
 
 def print_report(results: list[dict]):
-    """Print a performance report."""
     if not results:
-        logger.info("No results to report")
+        print("No results.")
         return
 
     n = len(results)
     briers = [r["brier"] for r in results]
     avg_brier = sum(briers) / n
 
-    # Directional accuracy
     correct = sum(
         1 for r in results
-        if (r["forecast"] > 0.5 and r["actual"] == 1) or (r["forecast"] < 0.5 and r["actual"] == 0)
+        if (r["forecast"] > 0.5 and r["actual"] == 1) or
+           (r["forecast"] < 0.5 and r["actual"] == 0) or
+           (r["forecast"] == 0.5)
     )
-    accuracy = correct / n
 
-    # Market baseline (what if we just used the market price as our forecast?)
     market_briers = [
         (r["market_price"] - r["actual"]) ** 2
-        for r in results
-        if r["market_price"] is not None
+        for r in results if r["market_price"] is not None
     ]
-    avg_market_brier = sum(market_briers) / len(market_briers) if market_briers else None
+    avg_mkt_brier = sum(market_briers) / len(market_briers) if market_briers else None
 
-    # Trading PnL
     trades = [r for r in results if r["hyp_pnl"] is not None]
     total_pnl = sum(r["hyp_pnl"] for r in trades) if trades else 0
     winners = sum(1 for r in trades if r["hyp_pnl"] > 0)
     losers = sum(1 for r in trades if r["hyp_pnl"] < 0)
+    flat = sum(1 for r in trades if r["hyp_pnl"] == 0)
 
-    # Error buckets
-    from collections import Counter
     error_counts = Counter(r["error_bucket"] for r in results if r["error_bucket"])
+    avg_evidence = sum(r["evidence_count"] for r in results) / n
 
     print("\n" + "=" * 70)
     print("              BACKTEST PERFORMANCE REPORT")
     print("=" * 70)
     print(f"\n  Markets evaluated:     {n}")
-    print(f"  Directional accuracy:  {correct}/{n} ({accuracy:.1%})")
-    print(f"\n  Avg Brier score:       {avg_brier:.4f}  (lower = better, 0 = perfect)")
-    if avg_market_brier is not None:
-        print(f"  Market baseline Brier: {avg_market_brier:.4f}")
-        edge = avg_market_brier - avg_brier
-        print(f"  Edge vs market:        {edge:+.4f}  {'(BEATING market)' if edge > 0 else '(losing to market)'}")
+    print(f"  Avg evidence per mkt:  {avg_evidence:.1f} sources")
+    print(f"  Directional accuracy:  {correct}/{n} ({correct/n:.1%})")
+    print(f"\n  Avg Brier score:       {avg_brier:.4f}  (lower = better)")
+    if avg_mkt_brier is not None:
+        print(f"  Market baseline Brier: {avg_mkt_brier:.4f}")
+        edge = avg_mkt_brier - avg_brier
+        if edge > 0:
+            print(f"  Edge vs market:        {edge:+.4f}  ** BEATING THE MARKET **")
+        else:
+            print(f"  Edge vs market:        {edge:+.4f}  (market is better)")
 
     if trades:
         print(f"\n  --- Hypothetical Trading ---")
         print(f"  Trades taken:          {len(trades)}")
-        print(f"  Winners:               {winners}")
-        print(f"  Losers:                {losers}")
-        print(f"  Win rate:              {winners/len(trades):.1%}" if trades else "")
+        print(f"  Winners / Losers:      {winners}W / {losers}L / {flat}flat")
+        if len(trades) > 0:
+            print(f"  Win rate:              {winners/len(trades):.1%}")
         print(f"  Total PnL:             ${total_pnl:+.2f}")
-    else:
-        print(f"\n  No trades met risk gates")
+
+    # Show best and worst calls
+    sorted_by_brier = sorted(results, key=lambda r: r["brier"])
+    print(f"\n  --- Best Calls (lowest Brier) ---")
+    for r in sorted_by_brier[:5]:
+        print(f"    {r['title'][:55]:55s} brier={r['brier']:.3f} p={r['forecast']:.2f} actual={r['actual']}")
+
+    worst = sorted(results, key=lambda r: r["brier"], reverse=True)
+    print(f"\n  --- Worst Calls (highest Brier) ---")
+    for r in worst[:5]:
+        print(f"    {r['title'][:55]:55s} brier={r['brier']:.3f} p={r['forecast']:.2f} actual={r['actual']}")
 
     if error_counts:
         print(f"\n  --- Mistake Taxonomy ---")
         for bucket, count in error_counts.most_common():
-            print(f"  {bucket:40s} {count}")
+            pct = count / n * 100
+            print(f"    {bucket:40s} {count:3d} ({pct:.0f}%)")
 
     print("\n" + "=" * 70)
 
+
+# ─── Main ──────────────────────────────────────────────────────────────────
 
 async def main():
     setup_logging(log_level="INFO")
@@ -455,33 +444,34 @@ async def main():
 
     try:
         print("\n" + "=" * 70)
-        print("  STEP 1: Fetching resolved markets with known outcomes")
+        print("  STEP 1: Fetching resolved markets (5 pages of events)")
         print("=" * 70)
-        n_resolved = await fetch_resolved_markets(session, max_events=30)
+        await fetch_resolved_markets(session, max_pages=5)
 
         print("\n" + "=" * 70)
-        print("  STEP 2: Running forecaster on historical markets")
-        print("  (the LLM sees market title + rules + market price, NOT the outcome)")
+        print("  STEP 2: Running forecaster with evidence on resolved markets")
+        print("  (LLM sees title + rules + market price + news — NOT the outcome)")
         print("=" * 70)
-        results = await run_backtest_forecasts(session)
+        results = await run_backtest(session, max_markets=50)
 
         print("\n" + "=" * 70)
-        print("  STEP 3: Scoring and generating postmortems")
+        print("  STEP 3: Performance report")
         print("=" * 70)
         print_report(results)
 
         print("\n" + "=" * 70)
         print("  STEP 4: Retraining calibrator on results")
         print("=" * 70)
-        retrain_result = retrain_calibrator(session)
-
-        if retrain_result:
-            print(f"\n  Calibrator retrained and saved to data/models/calibrator_latest.lgb")
-            print(f"  Version: {retrain_result.get('version')}")
-            print(f"  Training samples: {retrain_result.get('n_samples')}")
-            print(f"  Training Brier: {retrain_result.get('brier_score', 'N/A')}")
+        retrain_out = retrain_calibrator(session)
+        if retrain_out:
+            result, mistakes = retrain_out
+            print(f"\n  Calibrator retrained: {result.get('version')}")
+            print(f"  Samples: {result.get('n_samples')}")
+            print(f"  Brier: {result.get('brier_score', 'N/A'):.4f}")
+            if mistakes:
+                print(f"  Mistake breakdown: {dict(mistakes)}")
         else:
-            print(f"\n  Not enough data to retrain yet — need more resolved markets")
+            print("  Not enough data to retrain")
 
     finally:
         session.close()
