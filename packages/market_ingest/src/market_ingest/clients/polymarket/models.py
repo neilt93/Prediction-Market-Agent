@@ -79,14 +79,37 @@ class PolyEvent(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class PolyClobLevel(BaseModel):
+    price: str = "0"
+    size: str = "0"
+
+
 class PolyClobOrderbook(BaseModel):
     market: str = ""
     asset_id: str = ""
-    bids: list[list[float]] = []
-    asks: list[list[float]] = []
+    bids: list[PolyClobLevel] = []
+    asks: list[PolyClobLevel] = []
     timestamp: str = ""
     last_trade_price: float | None = None
     tick_size: float | None = None
+
+    @field_validator("last_trade_price", "tick_size", mode="before")
+    @classmethod
+    def parse_optional_float(cls, v: object) -> float | None:
+        if v is None or v == "":
+            return None
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def bid_levels(self) -> list[tuple[float, float]]:
+        return [(float(b.price), float(b.size)) for b in self.bids]
+
+    @property
+    def ask_levels(self) -> list[tuple[float, float]]:
+        return [(float(a.price), float(a.size)) for a in self.asks]
 
 
 class PolyPricePoint(BaseModel):

@@ -37,8 +37,8 @@ async def quick_discover(session):
     count = 0
 
     try:
-        # Just one page of events
-        events = await gamma.list_events(active=True, limit=20, offset=0)
+        # Fetch top events by volume (most traded = most liquid individual markets)
+        events = await gamma.list_events(active=True, limit=100, offset=0, order="volume", ascending=False)
         logger.info(f"Fetched {len(events)} events from Polymarket")
 
         for event in events:
@@ -48,6 +48,12 @@ async def quick_discover(session):
                 if not pm.enable_order_book:
                     continue
                 market_data = mapper.market_to_db(pm, event)
+                # Store clob_token_ids for snapshot lookups
+                market_data["metadata_json"] = {
+                    "clob_token_ids": pm.clob_token_ids,
+                    "outcomes": pm.outcomes,
+                    "outcome_prices": pm.outcome_prices,
+                }
 
                 existing = (
                     session.query(Market)
@@ -57,9 +63,11 @@ async def quick_discover(session):
                     )
                     .first()
                 )
-                if not existing:
+                if existing:
+                    existing.metadata_json = market_data["metadata_json"]
+                else:
                     session.add(Market(**market_data))
-                    count += 1
+                count += 1
         session.commit()
         logger.info(f"Discovered {count} new markets")
     finally:
@@ -69,34 +77,63 @@ async def quick_discover(session):
 
 
 async def quick_snapshot(session):
-    """Snapshot order books for discovered markets."""
+    """Snapshot order books for discovered markets using CLOB API directly."""
     from market_ingest.clients.polymarket.clob_client import ClobClient
-    from market_ingest.clients.polymarket.gamma_client import GammaClient
-    from market_ingest.mappers.polymarket_mapper import PolymarketMapper
     from schemas.models.market import Market, MarketSnapshot
 
     clob = ClobClient()
-    gamma = GammaClient()
-    mapper = PolymarketMapper()
     count = 0
 
     try:
-        markets = session.query(Market).filter(Market.status == "open").limit(20).all()
+        # Get ALL open markets with clob token IDs, prioritize binary markets
+        all_markets = (
+            session.query(Market)
+            .filter(
+                Market.status == "open",
+                Market.metadata_json.isnot(None),
+            )
+            .all()
+        )
+        has_tokens = [m for m in all_markets if (m.metadata_json or {}).get("clob_token_ids")]
+        # Binary first, then multi
+        binary = [m for m in has_tokens if m.market_type == "binary"]
+        multi = [m for m in has_tokens if m.market_type != "binary"]
+        import random
+        random.shuffle(multi)
+        markets = binary + multi[:200]
         logger.info(f"Snapshotting {len(markets)} markets")
 
         for market in markets:
             try:
-                gamma_market = await gamma.get_market(market.platform_market_id)
-                ob = None
-                if gamma_market.clob_token_ids:
-                    try:
-                        ob = await clob.get_orderbook(gamma_market.clob_token_ids[0])
-                    except Exception:
-                        pass
+                # Use metadata_json to get clob token IDs, or skip
+                token_ids = (market.metadata_json or {}).get("clob_token_ids")
+                if not token_ids:
+                    continue
+                ob = await clob.get_orderbook(token_ids[0])
+                bids = ob.bid_levels
+                asks = ob.ask_levels
 
-                snapshot_data = mapper.to_snapshot(gamma_market, ob)
-                snapshot_data["market_id"] = market.id
-                session.add(MarketSnapshot(**snapshot_data))
+                best_bid = bids[0][0] if bids else None
+                best_ask = asks[0][0] if asks else None
+                mid = (best_bid + best_ask) / 2 if best_bid and best_ask else None
+                spread_bps = int((best_ask - best_bid) * 10000) if best_bid and best_ask else None
+                bid_depth = sum(l[1] for l in bids[:5]) if bids else 0
+                ask_depth = sum(l[1] for l in asks[:5]) if asks else 0
+                total = bid_depth + ask_depth
+                imbalance = bid_depth / total if total > 0 else 0.5
+
+                snap = MarketSnapshot(
+                    market_id=market.id,
+                    ts=datetime.now(tz=timezone.utc),
+                    best_bid_yes=Decimal(str(best_bid)) if best_bid else None,
+                    best_ask_yes=Decimal(str(best_ask)) if best_ask else None,
+                    mid_yes=Decimal(str(mid)) if mid else None,
+                    last_yes=Decimal(str(ob.last_trade_price)) if ob.last_trade_price else None,
+                    spread_bps=spread_bps,
+                    liquidity_proxy=Decimal(str(total)) if total else None,
+                    orderbook_imbalance=Decimal(str(round(imbalance, 6))),
+                )
+                session.add(snap)
                 count += 1
             except Exception as e:
                 logger.warning(f"Snapshot failed for {market.title[:40]}: {e}")
@@ -105,7 +142,6 @@ async def quick_snapshot(session):
         logger.info(f"Captured {count} snapshots")
     finally:
         await clob.close()
-        await gamma.close()
 
     return count
 
@@ -124,7 +160,8 @@ async def quick_forecast(session):
     calibrator = Calibrator()
     policy = ExecutionPolicy(PolicyConfig(
         min_edge_bps=300,
-        min_confidence=0.5,
+        min_confidence=0.3,
+        max_spread_bps=15000,  # Relaxed for Polymarket sub-markets (tighten for Kalshi)
         max_position_per_market=3,
         daily_max_loss=50.0,
     ))
@@ -135,12 +172,18 @@ async def quick_forecast(session):
         model="llama3.1:8b",
     )
 
+    # Forecast markets with snapshots, ordered by tightest spread
+    from sqlalchemy import func
     markets = (
         session.query(Market)
-        .filter(Market.status == "open")
-        .limit(10)
+        .join(MarketSnapshot, MarketSnapshot.market_id == Market.id)
+        .filter(Market.status == "open", MarketSnapshot.spread_bps.isnot(None))
+        .group_by(Market.id)
+        .order_by(func.min(MarketSnapshot.spread_bps))
+        .limit(15)
         .all()
     )
+    logger.info(f"Found {len(markets)} markets to forecast (ordered by spread)")
 
     stats = {"forecasts": 0, "trades": 0, "abstains": 0}
 
@@ -160,24 +203,14 @@ async def quick_forecast(session):
         # Parse rules
         parsed = rule_parser.parse(market.title, market.rules_text)
 
-        # Try LLM forecast, fall back to mock
-        try:
-            forecast_output = await forecaster.forecast(
-                title=market.title,
-                rules_text=market.rules_text,
-                parsed_rules=parsed.model_dump(),
-                market_price=market_price,
-                time_to_close_hours=time_to_close / 3600 if time_to_close else None,
-            )
-        except Exception:
-            # Mock forecast if no LLM available
-            import random
-            forecast_output = ForecastOutput(
-                raw_probability=max(0.05, min(0.95, market_price + random.gauss(0, 0.1))),
-                confidence=random.uniform(0.4, 0.9),
-                abstain=False,
-                reasoning_summary="Mock forecast (no LLM available)",
-            )
+        # Forecast with LLM (falls back gracefully inside Forecaster if it errors)
+        forecast_output = await forecaster.forecast(
+            title=market.title,
+            rules_text=market.rules_text,
+            parsed_rules=parsed.model_dump(),
+            market_price=market_price,
+            time_to_close_hours=time_to_close / 3600 if time_to_close else None,
+        )
 
         if forecast_output.abstain:
             stats["abstains"] += 1
@@ -187,7 +220,7 @@ async def quick_forecast(session):
         forecast = Forecast(
             market_id=market.id,
             ts=datetime.now(tz=timezone.utc),
-            model_name="mock-v1",
+            model_name="llama3.1:8b",
             raw_probability=Decimal(str(round(forecast_output.raw_probability, 6))),
             confidence=Decimal(str(round(forecast_output.confidence, 6))),
             abstain_flag=forecast_output.abstain,
@@ -247,14 +280,22 @@ async def quick_forecast(session):
             )
             session.add(order)
 
-            position = Position(
-                market_id=market.id,
-                net_qty=decision.quantity if decision.side == "buy_yes" else -decision.quantity,
-                avg_cost=Decimal(str(decision.limit_price)),
-                mark_price=Decimal(str(market_price)),
-                realized_pnl=Decimal("0"),
-            )
-            session.merge(position)
+            existing_pos = session.query(Position).filter(Position.market_id == market.id).first()
+            if existing_pos:
+                if decision.side == "buy_yes":
+                    existing_pos.net_qty += decision.quantity
+                else:
+                    existing_pos.net_qty -= decision.quantity
+                existing_pos.mark_price = Decimal(str(market_price))
+            else:
+                qty = decision.quantity if decision.side == "buy_yes" else -decision.quantity
+                session.add(Position(
+                    market_id=market.id,
+                    net_qty=qty,
+                    avg_cost=Decimal(str(decision.limit_price)),
+                    mark_price=Decimal(str(market_price)),
+                    realized_pnl=Decimal("0"),
+                ))
             stats["trades"] += 1
             logger.info(
                 f"TRADE: {decision.side} {market.title[:50]} @ {decision.limit_price:.2f} "
