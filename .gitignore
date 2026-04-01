@@ -5,6 +5,7 @@ dist/
 build/
 .venv/
 .env
+secrets/
 *.db
 data/raw/*
 data/processed/*

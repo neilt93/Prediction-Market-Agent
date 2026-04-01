@@ -7,6 +7,6 @@ class KalshiEnvironment(str, enum.Enum):
 
 
 KALSHI_BASE_URLS = {
-    KalshiEnvironment.DEMO: "https://demo-api.kalshi.com/trade-api/v2",
-    KalshiEnvironment.PROD: "https://api.kalshi.com/trade-api/v2",
+    KalshiEnvironment.DEMO: "https://api.elections.kalshi.com/trade-api/v2",
+    KalshiEnvironment.PROD: "https://api.elections.kalshi.com/trade-api/v2",
 }
