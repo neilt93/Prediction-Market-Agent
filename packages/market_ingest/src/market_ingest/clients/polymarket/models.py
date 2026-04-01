@@ -1,6 +1,23 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+import json
+
+from pydantic import BaseModel, Field, field_validator
+
+
+def _parse_json_list(v: object) -> list[str]:
+    """Parse a JSON string list or return as-is if already a list."""
+    if isinstance(v, str):
+        try:
+            parsed = json.loads(v)
+            if isinstance(parsed, list):
+                return [str(x) for x in parsed]
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return []
+    if isinstance(v, list):
+        return [str(x) for x in v]
+    return []
 
 
 class PolyGammaMarket(BaseModel):
@@ -30,6 +47,18 @@ class PolyGammaMarket(BaseModel):
     clob_token_ids: list[str] | None = Field(None, alias="clobTokenIds")
 
     model_config = {"populate_by_name": True}
+
+    @field_validator("outcomes", "outcome_prices", mode="before")
+    @classmethod
+    def parse_json_string_list(cls, v: object) -> list[str]:
+        return _parse_json_list(v)
+
+    @field_validator("clob_token_ids", mode="before")
+    @classmethod
+    def parse_clob_token_ids(cls, v: object) -> list[str] | None:
+        if v is None:
+            return None
+        return _parse_json_list(v)
 
 
 class PolyEvent(BaseModel):
