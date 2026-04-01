@@ -1,0 +1,22 @@
+[project]
+name = "prediction-agent-api"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "prediction-agent-shared",
+    "prediction-agent-schemas",
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "httpx>=0.27",
+]
+
+[tool.uv.sources]
+prediction-agent-shared = { workspace = true }
+prediction-agent-schemas = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/api"]

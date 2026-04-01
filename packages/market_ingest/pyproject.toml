@@ -1,0 +1,22 @@
+[project]
+name = "prediction-agent-market-ingest"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "prediction-agent-shared",
+    "prediction-agent-schemas",
+    "httpx>=0.27",
+    "aiohttp>=3.9",
+    "cryptography>=42.0",
+]
+
+[tool.uv.sources]
+prediction-agent-shared = { workspace = true }
+prediction-agent-schemas = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/market_ingest"]
