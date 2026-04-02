@@ -127,7 +127,7 @@ class EvidenceRetriever:
             return True
         published_at = item.get("published_at")
         if not isinstance(published_at, datetime):
-            return False
+            return True  # No timestamp = include (DuckDuckGo, CoinGecko, Wikipedia)
         if published_at.tzinfo is None:
             published_at = published_at.replace(tzinfo=timezone.utc)
         return published_at.astimezone(timezone.utc) <= as_of
