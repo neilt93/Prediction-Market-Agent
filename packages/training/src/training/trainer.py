@@ -25,10 +25,13 @@ class CalibrationTrainer:
     def __init__(self, db_session: Session) -> None:
         self.db = db_session
 
-    def build_training_dataset(self) -> tuple[pd.DataFrame, pd.Series]:
+    def build_training_dataset(
+        self,
+        market_ids: set[Any] | None = None,
+    ) -> tuple[pd.DataFrame, pd.Series]:
         """Build training dataset from forecasts with known outcomes."""
         # Join forecasts -> features -> outcomes
-        results = (
+        query = (
             self.db.query(
                 ForecastFeature,
                 Forecast.raw_probability,
@@ -39,8 +42,10 @@ class CalibrationTrainer:
             .join(MarketOutcome, Forecast.market_id == MarketOutcome.market_id)
             .outerjoin(Postmortem, Forecast.market_id == Postmortem.market_id)
             .filter(MarketOutcome.resolved_label.isnot(None))
-            .all()
         )
+        if market_ids:
+            query = query.filter(Forecast.market_id.in_(list(market_ids)))
+        results = query.all()
 
         if not results:
             return pd.DataFrame(), pd.Series(dtype=float)
@@ -68,9 +73,13 @@ class CalibrationTrainer:
 
         return pd.DataFrame(rows), pd.Series(labels, dtype=float)
 
-    def retrain(self, save_path: str | None = None) -> dict[str, Any]:
+    def retrain(
+        self,
+        save_path: str | None = None,
+        market_ids: set[Any] | None = None,
+    ) -> dict[str, Any]:
         """Retrain the calibrator and optionally save it."""
-        features_df, labels = self.build_training_dataset()
+        features_df, labels = self.build_training_dataset(market_ids=market_ids)
 
         if len(features_df) < 20:
             logger.warning("insufficient_training_data", n_samples=len(features_df))

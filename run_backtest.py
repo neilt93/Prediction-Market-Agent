@@ -12,14 +12,14 @@ Full pipeline:
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 import math
-import sys
 import random
-from datetime import datetime, timezone
+import sys
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from collections import Counter
 
 for pkg in ["shared", "schemas", "market_ingest", "rules", "forecasting",
             "calibration", "execution", "training", "evidence"]:
@@ -38,6 +38,40 @@ def get_db():
     engine = create_sync_engine(settings.database_url_sync)
     factory = create_sync_session_factory(engine)
     return factory()
+
+
+EVAL_LOOKBACK_HOURS = (24, 12, 6, 2)
+
+
+def _select_history_point(history: list[Any], close_time: datetime | None) -> Any | None:
+    if close_time is None:
+        return None
+    close_ts = int(close_time.timestamp())
+    for hours in EVAL_LOOKBACK_HOURS:
+        cutoff_ts = close_ts - int(hours * 3600)
+        candidates = [point for point in history if point.t <= cutoff_ts]
+        if candidates:
+            return candidates[-1]
+    return None
+
+
+def _select_backtest_snapshot(session, market) -> Any | None:
+    from schemas.models.market import MarketSnapshot
+
+    query = session.query(MarketSnapshot).filter(MarketSnapshot.market_id == market.id)
+    if market.close_time is None:
+        return query.order_by(MarketSnapshot.ts.asc()).first()
+
+    for hours in EVAL_LOOKBACK_HOURS:
+        cutoff = market.close_time - timedelta(hours=hours)
+        snapshot = (
+            query.filter(MarketSnapshot.ts <= cutoff)
+            .order_by(MarketSnapshot.ts.desc())
+            .first()
+        )
+        if snapshot:
+            return snapshot
+    return None
 
 
 # ─── STEP 1: Ingest resolved markets ───────────────────────────────────────
@@ -98,27 +132,36 @@ async def fetch_resolved_markets(session, max_pages: int = 5):
                 outcome_data["market_id"] = market.id
                 session.add(MarketOutcome(**outcome_data))
 
-                # Get price history for synthetic pre-resolution snapshot
+                # Build a snapshot from the last observable price at least a few
+                # hours before close so the backtest does not peek near resolution.
                 if pm.clob_token_ids:
                     try:
                         history = await clob.get_prices_history(
                             pm.clob_token_ids[0], interval="max", fidelity=60,
                         )
-                        if history and len(history) > 10:
-                            idx = int(len(history) * 0.6)  # 60% through = before final convergence
-                            pt = history[idx]
-                            snap = MarketSnapshot(
-                                market_id=market.id,
-                                ts=datetime.fromtimestamp(pt.t, tz=timezone.utc),
-                                mid_yes=Decimal(str(round(pt.p, 6))),
-                                last_yes=Decimal(str(round(pt.p, 6))),
-                                best_bid_yes=Decimal(str(round(max(0.01, pt.p - 0.02), 6))),
-                                best_ask_yes=Decimal(str(round(min(0.99, pt.p + 0.02), 6))),
-                                spread_bps=400,
-                                liquidity_proxy=Decimal("100"),
-                                orderbook_imbalance=Decimal("0.5"),
-                            )
-                            session.add(snap)
+                        if history:
+                            pt = _select_history_point(history, market_data["close_time"])
+                            if pt is not None:
+                                snapshot_ts = datetime.fromtimestamp(pt.t, tz=timezone.utc)
+                                time_to_close_sec = None
+                                if market_data["close_time"] is not None:
+                                    time_to_close_sec = max(
+                                        0,
+                                        int((market_data["close_time"] - snapshot_ts).total_seconds()),
+                                    )
+                                snap = MarketSnapshot(
+                                    market_id=market.id,
+                                    ts=snapshot_ts,
+                                    mid_yes=Decimal(str(round(pt.p, 6))),
+                                    last_yes=Decimal(str(round(pt.p, 6))),
+                                    best_bid_yes=Decimal(str(round(max(0.01, pt.p - 0.02), 6))),
+                                    best_ask_yes=Decimal(str(round(min(0.99, pt.p + 0.02), 6))),
+                                    spread_bps=400,
+                                    liquidity_proxy=Decimal("100"),
+                                    orderbook_imbalance=Decimal("0.5"),
+                                    time_to_close_sec=time_to_close_sec,
+                                )
+                                session.add(snap)
                     except Exception:
                         pass
 
@@ -149,7 +192,7 @@ async def run_backtest(session, max_markets: int = 50):
     from sqlalchemy import exists
 
     rule_parser = RuleParser()
-    calibrator = Calibrator(model_path="data/models/calibrator_latest.lgb")
+    calibrator = Calibrator()
     forecaster = Forecaster(api_url="http://localhost:11434/v1", model="llama3.1:8b")
     evidence = EvidenceRetriever()
     policy = ExecutionPolicy(PolicyConfig(
@@ -188,16 +231,15 @@ async def run_backtest(session, max_markets: int = 50):
         if session.query(Forecast).filter(Forecast.market_id == market.id).first():
             continue
 
-        snapshot = (
-            session.query(MarketSnapshot)
-            .filter(MarketSnapshot.market_id == market.id)
-            .order_by(MarketSnapshot.ts.desc())
-            .first()
-        )
+        snapshot = _select_backtest_snapshot(session, market)
+        if snapshot is None:
+            continue
         market_price = float(snapshot.mid_yes) if snapshot and snapshot.mid_yes else None
         spread_bps = snapshot.spread_bps if snapshot else None
         liquidity = float(snapshot.liquidity_proxy) if snapshot and snapshot.liquidity_proxy else None
         time_to_close = snapshot.time_to_close_sec if snapshot else None
+        if time_to_close is None and snapshot and market.close_time:
+            time_to_close = max(0, int((market.close_time - snapshot.ts).total_seconds()))
 
         # Parse rules
         parsed = rule_parser.parse(market.title, market.rules_text)
@@ -207,6 +249,7 @@ async def run_backtest(session, max_markets: int = 50):
             title=market.title,
             entity=parsed.entity,
             category=market.category,
+            as_of=snapshot.ts,
         )
 
         # Forecast with evidence

@@ -11,13 +11,13 @@ After all passes: prints niche-filtered analysis.
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 import math
 import sys
-import random
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from collections import Counter
+from typing import Any
 
 for pkg in ["shared", "schemas", "market_ingest", "rules", "forecasting",
             "calibration", "execution", "training", "evidence"]:
@@ -36,6 +36,9 @@ def get_db():
     engine = create_sync_engine(settings.database_url_sync)
     factory = create_sync_session_factory(engine)
     return factory()
+
+
+EVAL_LOOKBACK_HOURS = (24, 12, 6, 2)
 
 
 CRYPTO_KEYWORDS = ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crypto",
@@ -71,7 +74,32 @@ def classify_market(title: str) -> str:
     return "other"
 
 
-async def run_one_pass(session, pass_num: int, per_pass: int = 50, niche_only: bool = False):
+def _select_backtest_snapshot(session, market):
+    from schemas.models.market import MarketSnapshot
+
+    query = session.query(MarketSnapshot).filter(MarketSnapshot.market_id == market.id)
+    if market.close_time is None:
+        return query.order_by(MarketSnapshot.ts.asc()).first()
+
+    for hours in EVAL_LOOKBACK_HOURS:
+        cutoff = market.close_time - timedelta(hours=hours)
+        snapshot = (
+            query.filter(MarketSnapshot.ts <= cutoff)
+            .order_by(MarketSnapshot.ts.desc())
+            .first()
+        )
+        if snapshot:
+            return snapshot
+    return None
+
+
+async def run_one_pass(
+    session,
+    pass_num: int,
+    per_pass: int = 50,
+    niche_only: bool = False,
+    calibrator_model_path: str | None = None,
+):
     """Run one backtest pass on un-forecasted markets."""
     from forecasting.forecaster import Forecaster
     from calibration.calibrator import Calibrator
@@ -81,10 +109,10 @@ async def run_one_pass(session, pass_num: int, per_pass: int = 50, niche_only: b
     from schemas.models.market import Market, MarketSnapshot, MarketOutcome
     from schemas.models.forecast import Forecast, ForecastFeature, CalibratedForecast
     from schemas.models.postmortem import Postmortem
-    from sqlalchemy import exists, and_
+    from sqlalchemy import exists
 
     rule_parser = RuleParser()
-    calibrator = Calibrator(model_path="data/models/calibrator_latest.lgb")
+    calibrator = Calibrator(model_path=calibrator_model_path)
     forecaster = Forecaster(api_url="http://localhost:11434/v1", model="llama3.1:8b")
     evidence_retriever = EvidenceRetriever()
     policy = ExecutionPolicy(PolicyConfig(
@@ -103,6 +131,7 @@ async def run_one_pass(session, pass_num: int, per_pass: int = 50, niche_only: b
             exists().where(MarketSnapshot.market_id == Market.id),
             ~Market.id.in_(session.query(already_forecasted)),
         )
+        .order_by(Market.close_time.asc(), Market.id.asc())
         .all()
     )
 
@@ -113,7 +142,6 @@ async def run_one_pass(session, pass_num: int, per_pass: int = 50, niche_only: b
     # Diversify
     seen: dict[str, int] = {}
     diverse = []
-    random.shuffle(candidates)
     for m, o in candidates:
         key = (m.subtitle or "")[:40]
         seen[key] = seen.get(key, 0) + 1
@@ -128,19 +156,23 @@ async def run_one_pass(session, pass_num: int, per_pass: int = 50, niche_only: b
 
     results = []
     for i, (market, outcome) in enumerate(batch):
-        snapshot = (
-            session.query(MarketSnapshot)
-            .filter(MarketSnapshot.market_id == market.id)
-            .order_by(MarketSnapshot.ts.desc())
-            .first()
-        )
+        snapshot = _select_backtest_snapshot(session, market)
+        if snapshot is None:
+            continue
         market_price = float(snapshot.mid_yes) if snapshot and snapshot.mid_yes else None
         spread_bps = snapshot.spread_bps if snapshot else None
         liquidity = float(snapshot.liquidity_proxy) if snapshot and snapshot.liquidity_proxy else None
         time_to_close = snapshot.time_to_close_sec if snapshot else None
+        if time_to_close is None and market.close_time:
+            time_to_close = max(0, int((market.close_time - snapshot.ts).total_seconds()))
 
         parsed = rule_parser.parse(market.title, market.rules_text)
-        bundle = await evidence_retriever.gather(market.title, parsed.entity, market.category)
+        bundle = await evidence_retriever.gather(
+            market.title,
+            parsed.entity,
+            market.category,
+            as_of=snapshot.ts,
+        )
 
         forecast_output = await forecaster.forecast(
             title=market.title,
@@ -238,6 +270,7 @@ async def run_one_pass(session, pass_num: int, per_pass: int = 50, niche_only: b
 
         niche = classify_market(market.title)
         results.append({
+            "market_id": market.id,
             "title": market.title[:60],
             "niche": niche,
             "market_price": market_price,
@@ -263,14 +296,14 @@ async def run_one_pass(session, pass_num: int, per_pass: int = 50, niche_only: b
     return results
 
 
-def retrain(session):
+def retrain(session, save_path: str, market_ids: set[Any]):
     from training.trainer import CalibrationTrainer
     trainer = CalibrationTrainer(session)
-    features_df, labels = trainer.build_training_dataset()
+    features_df, labels = trainer.build_training_dataset(market_ids=market_ids)
     if len(features_df) < 15:
         return None, {}
     Path("data/models").mkdir(parents=True, exist_ok=True)
-    result = trainer.retrain(save_path="data/models/calibrator_latest.lgb")
+    result = trainer.retrain(save_path=save_path, market_ids=market_ids)
     mistakes = trainer.get_mistake_summary()
     return result, mistakes
 
@@ -355,6 +388,9 @@ async def main():
 
     setup_logging(log_level="INFO")
     session = get_db()
+    walkforward_model_path = str(Path("data/models/calibrator_walkforward.lgb"))
+    calibrator_model_path: str | None = None
+    completed_market_ids: set[Any] = set()
 
     all_results = []
     try:
@@ -363,16 +399,28 @@ async def main():
             print(f"  PASS {p}/{args.passes}")
             print(f"{'='*75}")
 
-            results = await run_one_pass(session, p, per_pass=args.per_pass, niche_only=args.niche_only)
+            results = await run_one_pass(
+                session,
+                p,
+                per_pass=args.per_pass,
+                niche_only=args.niche_only,
+                calibrator_model_path=calibrator_model_path,
+            )
             all_results.extend(results)
+            completed_market_ids.update(r["market_id"] for r in results)
 
             if not results:
                 logger.info("No more markets — stopping early")
                 break
 
-            # Retrain calibrator after each pass
-            retrain_out, mistakes = retrain(session)
+            # Retrain on completed passes and only reuse that model on later passes.
+            retrain_out, mistakes = retrain(
+                session,
+                walkforward_model_path,
+                completed_market_ids,
+            )
             if retrain_out:
+                calibrator_model_path = walkforward_model_path
                 logger.info(f"Calibrator retrained: {retrain_out.get('version')} "
                            f"({retrain_out.get('n_samples')} samples, "
                            f"Brier={retrain_out.get('brier_score', 0):.4f})")

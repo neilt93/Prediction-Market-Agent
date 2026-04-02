@@ -81,6 +81,36 @@ def classify_niche(title: str) -> str | None:
     return None
 
 
+def orderbook_yes_mid_cents(orderbook: Any) -> int | None:
+    yes_levels = getattr(orderbook, "yes", None) or []
+    no_levels = getattr(orderbook, "no", None) or []
+    if not yes_levels or not no_levels:
+        return None
+    best_bid_cents = int(yes_levels[0][0])
+    best_ask_cents = int(100 - no_levels[0][0])
+    return int(round((best_bid_cents + best_ask_cents) / 2))
+
+
+def filled_contract_count(order: Any, requested_count: int) -> int:
+    placed = int(getattr(order, "place_count", 0) or 0)
+    remaining = int(getattr(order, "remaining_count", 0) or 0)
+    if placed > 0:
+        return max(0, placed - remaining)
+
+    status = str(getattr(order, "status", "") or "").lower()
+    if remaining == 0 and status not in {"canceled", "cancelled", "rejected"}:
+        return requested_count
+    return 0
+
+
+def fill_price_cents(order: Any, side: str, fallback_price_cents: int) -> int:
+    field_name = "yes_price" if side == "yes" else "no_price"
+    raw_price = getattr(order, field_name, None)
+    if raw_price in (None, 0, "0"):
+        return fallback_price_cents
+    return max(1, min(99, int(raw_price)))
+
+
 # ─── Safety state tracker ───────────────────────────────────────────────────
 
 class SafetyState:
@@ -98,7 +128,7 @@ class SafetyState:
         self._pause_until: datetime | None = None
         self._api_error_count = 0
         # Position tracking
-        self._positions: dict[str, dict] = {}  # ticker -> {qty, cost, category, event}
+        self._positions: dict[str, dict[str, Any]] = {}
         self._expected_balance: int | None = None
         # Model integrity
         self._model_hash: str | None = None
@@ -215,7 +245,7 @@ class SafetyState:
 
         # Position limit per market
         pos = self._positions.get(ticker)
-        if pos and abs(pos["qty"]) * 100 >= self.config["max_per_trade_cents"]:
+        if pos and pos["qty"] * 100 >= self.config["max_per_trade_cents"]:
             return f"Max position reached for {ticker}"
 
         # No averaging down
@@ -223,7 +253,7 @@ class SafetyState:
             return f"Already positioned in {ticker} — no averaging"
 
         # Total exposure cap
-        total_exposure = sum(abs(p["qty"]) * p.get("cost", 50) for p in self._positions.values())
+        total_exposure = sum(p["qty"] * p.get("cost_cents", 50) for p in self._positions.values())
         if total_exposure >= self.config["max_total_exposure_cents"]:
             return f"Total exposure ${total_exposure/100:.2f} at limit"
 
@@ -253,17 +283,30 @@ class SafetyState:
             return False
         return True
 
-    def record_trade(self, ticker: str, side: str, qty: int, cost_cents: int,
-                     niche: str, event_ticker: str):
+    def open_tickers(self) -> list[str]:
+        return list(self._positions)
+
+    def record_trade(
+        self,
+        ticker: str,
+        side: str,
+        qty: int,
+        cost_cents: int,
+        niche: str,
+        event_ticker: str,
+    ) -> None:
         self._positions[ticker] = {
-            "qty": qty if side == "yes" else -qty,
-            "cost": cost_cents,
+            "qty": qty,
+            "side": side,
+            "cost_cents": cost_cents,
+            "last_contract_price_cents": cost_cents,
+            "current_contract_price_cents": cost_cents,
             "category": niche,
             "event": event_ticker,
         }
         self._daily_trade_count += 1
 
-    def record_pnl(self, pnl_cents: int):
+    def record_pnl(self, pnl_cents: int) -> None:
         pnl = pnl_cents / 100
         self._daily_pnl += pnl
         self._weekly_pnl += pnl
@@ -272,18 +315,44 @@ class SafetyState:
         else:
             self._consecutive_losses = 0
 
-    def check_position_health(self):
-        """Flag if any position shows > 50% loss."""
-        for ticker, pos in self._positions.items():
-            if pos["qty"] != 0 and pos["cost"] > 0:
-                # Rough check: if cost was > 50 cents and now we'd lose > 50%
-                # This is approximate without live mark price
-                pass  # Will implement with live mark-to-market
+    def mark_position(self, ticker: str, yes_mid_cents: int) -> None:
+        pos = self._positions.get(ticker)
+        if pos is None:
+            return
+        current_contract_price_cents = yes_mid_cents if pos["side"] == "yes" else 100 - yes_mid_cents
+        last_contract_price_cents = pos.get("last_contract_price_cents", current_contract_price_cents)
+        pnl_delta_cents = (current_contract_price_cents - last_contract_price_cents) * pos["qty"]
+        if pnl_delta_cents != 0:
+            self.record_pnl(pnl_delta_cents)
+        pos["last_contract_price_cents"] = current_contract_price_cents
+        pos["current_contract_price_cents"] = current_contract_price_cents
 
-    def record_api_error(self):
+    def check_position_health(self) -> None:
+        """Flag if any live-marked position shows > 50% loss."""
+        for ticker, pos in self._positions.items():
+            cost_cents = pos.get("cost_cents", 0)
+            current_contract_price_cents = pos.get("current_contract_price_cents")
+            if not cost_cents or current_contract_price_cents is None:
+                continue
+            loss_ratio = (cost_cents - current_contract_price_cents) / cost_cents
+            if loss_ratio >= 0.5:
+                self._flagged_for_review = True
+                logger.error(
+                    "POSITION HEALTH FLAG",
+                    ticker=ticker,
+                    side=pos.get("side"),
+                    entry_cents=cost_cents,
+                    mark_cents=current_contract_price_cents,
+                    loss_ratio=round(loss_ratio, 3),
+                )
+
+    def sync_balance(self, actual_balance: int) -> None:
+        self._expected_balance = actual_balance
+
+    def record_api_error(self) -> None:
         self._api_error_count += 1
 
-    def clear_api_errors(self):
+    def clear_api_errors(self) -> None:
         self._api_error_count = 0
 
 
@@ -316,6 +385,7 @@ class LiveTrader:
             "consecutive_loss_pause": 5,
         })
         self._cycle_count = 0
+        self._balance_getter: Any | None = None
 
     async def run(self):
         from market_ingest.clients.kalshi.client import KalshiClient
@@ -349,6 +419,8 @@ class LiveTrader:
             resp.raise_for_status()
             return resp.json().get("balance", 0)
 
+        self._balance_getter = get_balance
+
         mode = "DRY RUN" if self.dry_run else "LIVE TRADING"
         logger.info(f"=== KALSHI {mode} ===")
         logger.info(f"  Safety config: {json.dumps(self.safety.config, indent=2)}")
@@ -362,7 +434,7 @@ class LiveTrader:
 
         try:
             balance = get_balance()
-            self.safety._expected_balance = balance
+            self.safety.sync_balance(balance)
             logger.info(f"  Balance: ${balance/100:.2f}")
         except Exception as e:
             logger.error(f"  Auth failed: {e}")
@@ -375,12 +447,6 @@ class LiveTrader:
                     break
                 if not self.safety.check_model_integrity():
                     break
-
-                session_issue = self.safety.check_session_limits()
-                if session_issue:
-                    logger.info(f"  PAUSED: {session_issue}")
-                    await asyncio.sleep(60)
-                    continue
 
                 self._cycle_count += 1
                 ts = datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
@@ -399,6 +465,14 @@ class LiveTrader:
                     await asyncio.sleep(30)
                     continue
 
+                await self._refresh_position_marks(kalshi)
+
+                session_issue = self.safety.check_session_limits()
+                if session_issue:
+                    logger.info(f"  PAUSED: {session_issue}")
+                    await asyncio.sleep(60)
+                    continue
+
                 try:
                     await self._run_cycle(kalshi, forecaster, calibrator, evidence, rule_parser)
                 except Exception as e:
@@ -415,6 +489,19 @@ class LiveTrader:
             await forecaster.close()
             await evidence.close()
             logger.info("Shutdown complete")
+
+    async def _refresh_position_marks(self, kalshi) -> None:
+        for ticker in self.safety.open_tickers():
+            try:
+                orderbook = await kalshi.get_orderbook(ticker)
+            except Exception as exc:
+                logger.warning(f"Position mark refresh failed for {ticker}: {exc}")
+                continue
+            yes_mid_cents = orderbook_yes_mid_cents(orderbook)
+            if yes_mid_cents is None:
+                continue
+            self.safety.mark_position(ticker, yes_mid_cents)
+        self.safety.check_position_health()
 
     async def _run_cycle(self, kalshi, forecaster, calibrator, evidence, rule_parser):
         # 1. Discover target markets
@@ -452,7 +539,8 @@ class LiveTrader:
             except Exception:
                 continue
 
-            if not ob.yes or not ob.no:
+            yes_mid_cents = orderbook_yes_mid_cents(ob)
+            if yes_mid_cents is None:
                 continue
 
             best_bid_cents = ob.yes[0][0]
@@ -461,6 +549,9 @@ class LiveTrader:
             best_ask = (100 - best_no_bid_cents) / 100
             mid = (best_bid + best_ask) / 2
             spread_bps = int((best_ask - best_bid) * 10000)
+            if ticker in self.safety.open_tickers():
+                self.safety.mark_position(ticker, yes_mid_cents)
+                self.safety.check_position_health()
 
             # Time to close
             time_to_close_hours = None
@@ -565,12 +656,46 @@ class LiveTrader:
                     trade_record["order_status"] = result.status
                     logger.info(f"    Order: {result.order_id} status={result.status}")
 
-                    # Verify fill price tolerance (within 2 cents)
-                    if result.yes_price and abs(result.yes_price - limit_price_cents) > 2:
-                        logger.warning(f"    Fill price {result.yes_price}c vs limit {limit_price_cents}c — tolerance exceeded")
+                    filled_count = filled_contract_count(result, order.count)
+                    remaining_count = max(0, int(result.remaining_count or 0))
+                    trade_record["filled_count"] = filled_count
+                    trade_record["remaining_count"] = remaining_count
 
-                    self.safety.record_trade(ticker, side, 1, limit_price_cents, niche, event.event_ticker)
-                    self.safety._expected_balance -= limit_price_cents
+                    if remaining_count > 0:
+                        try:
+                            await kalshi.cancel_order(result.order_id)
+                            trade_record["remainder_canceled"] = remaining_count
+                            logger.info(f"    Canceled {remaining_count} resting contract(s)")
+                        except Exception as cancel_exc:
+                            logger.warning(f"    Failed to cancel remainder: {cancel_exc}")
+                            self.safety._expected_balance = None
+
+                    if filled_count > 0:
+                        executed_price_cents = fill_price_cents(result, side, limit_price_cents)
+                        trade_record["fill_price_cents"] = executed_price_cents
+                        if abs(executed_price_cents - limit_price_cents) > 2:
+                            logger.warning(
+                                f"    Fill price {executed_price_cents}c vs limit {limit_price_cents}c - tolerance exceeded"
+                            )
+                        self.safety.record_trade(
+                            ticker,
+                            side,
+                            filled_count,
+                            executed_price_cents,
+                            niche,
+                            event.event_ticker,
+                        )
+                        if self.safety._expected_balance is not None:
+                            self.safety._expected_balance -= executed_price_cents * filled_count
+                    else:
+                        logger.info("    No immediate fill; position not booked")
+
+                    if self._balance_getter is not None:
+                        try:
+                            self.safety.sync_balance(self._balance_getter())
+                        except Exception as balance_exc:
+                            logger.warning(f"    Post-trade balance sync failed: {balance_exc}")
+                            self.safety._expected_balance = None
 
                 except Exception as e:
                     logger.error(f"    Order failed: {e}")

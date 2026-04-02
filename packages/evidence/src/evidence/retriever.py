@@ -9,7 +9,7 @@ Gathers real-world context for markets from multiple sources:
 from __future__ import annotations
 
 import asyncio
-import hashlib
+from email.utils import parsedate_to_datetime
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -27,7 +27,14 @@ class EvidenceBundle:
         self.snippets: list[str] = []
         self.sources: list[dict[str, Any]] = []
 
-    def add(self, snippet: str, source_type: str, source_domain: str = "", url: str = "") -> None:
+    def add(
+        self,
+        snippet: str,
+        source_type: str,
+        source_domain: str = "",
+        url: str = "",
+        published_at: datetime | None = None,
+    ) -> None:
         if snippet and snippet not in self.snippets:
             self.snippets.append(snippet)
             self.sources.append({
@@ -35,6 +42,7 @@ class EvidenceBundle:
                 "source_domain": source_domain,
                 "url": url,
                 "snippet": snippet,
+                "published_at": published_at.isoformat() if published_at else None,
             })
 
     @property
@@ -54,9 +62,21 @@ class EvidenceRetriever:
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def gather(self, title: str, entity: str | None = None, category: str | None = None) -> EvidenceBundle:
-        """Gather evidence from all sources in parallel."""
+    async def gather(
+        self,
+        title: str,
+        entity: str | None = None,
+        category: str | None = None,
+        as_of: datetime | None = None,
+    ) -> EvidenceBundle:
+        """Gather evidence from all sources in parallel.
+
+        When as_of is provided, only evidence with an explicit publication
+        timestamp at or before that cutoff is retained. Sources without
+        timestamps are excluded to avoid historical leakage.
+        """
         bundle = EvidenceBundle()
+        cutoff = self._normalize_as_of(as_of)
 
         # Build search queries
         queries = [title]
@@ -84,12 +104,45 @@ class EvidenceRetriever:
                 continue
             if isinstance(result, list):
                 for item in result:
-                    bundle.add(**item)
+                    if self._should_include(item, cutoff):
+                        bundle.add(**item)
             elif isinstance(result, dict) and result.get("snippet"):
-                bundle.add(**result)
+                if self._should_include(result, cutoff):
+                    bundle.add(**result)
 
         logger.debug("evidence_gathered", title=title[:50], count=bundle.count)
         return bundle
+
+    @staticmethod
+    def _normalize_as_of(as_of: datetime | None) -> datetime | None:
+        if as_of is None:
+            return None
+        if as_of.tzinfo is None:
+            return as_of.replace(tzinfo=timezone.utc)
+        return as_of.astimezone(timezone.utc)
+
+    @staticmethod
+    def _should_include(item: dict[str, Any], as_of: datetime | None) -> bool:
+        if as_of is None:
+            return True
+        published_at = item.get("published_at")
+        if not isinstance(published_at, datetime):
+            return False
+        if published_at.tzinfo is None:
+            published_at = published_at.replace(tzinfo=timezone.utc)
+        return published_at.astimezone(timezone.utc) <= as_of
+
+    @staticmethod
+    def _parse_published_at(raw_value: str) -> datetime | None:
+        if not raw_value:
+            return None
+        try:
+            parsed = parsedate_to_datetime(raw_value)
+        except (TypeError, ValueError, IndexError):
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
 
     async def _search_duckduckgo(self, query: str) -> list[dict]:
         """DuckDuckGo instant answer API (no key needed)."""
@@ -138,12 +191,14 @@ class EvidenceRetriever:
                 title_text = entry.get("title", "")
                 published = entry.get("published", "")
                 source = entry.get("source", {}).get("title", "")
+                published_at = self._parse_published_at(published)
                 snippet = f"[{source}] {title_text} ({published})" if source else f"{title_text} ({published})"
                 results.append({
                     "snippet": snippet[:400],
                     "source_type": "news",
                     "source_domain": source or "google_news",
                     "url": entry.get("link", ""),
+                    "published_at": published_at,
                 })
             return results
         except Exception as e:

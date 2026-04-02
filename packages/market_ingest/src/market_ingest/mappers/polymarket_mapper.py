@@ -58,8 +58,10 @@ class PolymarketMapper:
         ob: PolyClobOrderbook | None = None,
         trades: list[PolyTrade] | None = None,
     ) -> dict[str, Any]:
-        best_bid_yes = ob.bids[0][0] if ob and ob.bids else pm.best_bid
-        best_ask_yes = ob.asks[0][0] if ob and ob.asks else pm.best_ask
+        bid_levels = ob.bid_levels if ob else []
+        ask_levels = ob.ask_levels if ob else []
+        best_bid_yes = bid_levels[0][0] if bid_levels else pm.best_bid
+        best_ask_yes = ask_levels[0][0] if ask_levels else pm.best_ask
         mid = (
             (best_bid_yes + best_ask_yes) / 2
             if best_bid_yes is not None and best_ask_yes is not None
@@ -77,8 +79,8 @@ class PolymarketMapper:
             except (ValueError, IndexError):
                 pass
 
-        bid_depth = sum(l[1] for l in ob.bids[:5]) if ob and ob.bids else 0
-        ask_depth = sum(l[1] for l in ob.asks[:5]) if ob and ob.asks else 0
+        bid_depth = sum(level[1] for level in bid_levels[:5]) if bid_levels else 0
+        ask_depth = sum(level[1] for level in ask_levels[:5]) if ask_levels else 0
         total = bid_depth + ask_depth
         imbalance = bid_depth / total if total > 0 else 0.5
 
