@@ -28,4 +28,4 @@ def test_historical_evidence_filters_future_and_undated_items() -> None:
 
     assert EvidenceRetriever._should_include(stale_item, as_of) is True
     assert EvidenceRetriever._should_include(future_item, as_of) is False
-    assert EvidenceRetriever._should_include(undated_item, as_of) is True  # undated sources included
+    assert EvidenceRetriever._should_include(undated_item, as_of) is False

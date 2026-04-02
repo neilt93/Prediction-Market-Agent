@@ -24,8 +24,15 @@ class KalshiMarket(BaseModel):
     subtitle: str | None = None
     yes_bid: int | None = Field(None, alias="yes_bid")
     yes_ask: int | None = Field(None, alias="yes_ask")
+    yes_bid_dollars: str | None = Field(None, alias="yes_bid_dollars")
+    yes_ask_dollars: str | None = Field(None, alias="yes_ask_dollars")
+    no_bid_dollars: str | None = Field(None, alias="no_bid_dollars")
+    no_ask_dollars: str | None = Field(None, alias="no_ask_dollars")
     last_price: int | None = None
+    last_price_dollars: str | None = Field(None, alias="last_price_dollars")
     volume: int | None = None
+    volume_24h_fp: str | None = Field(None, alias="volume_24h_fp")
+    liquidity_dollars: str | None = Field(None, alias="liquidity_dollars")
     open_interest: int | None = None
     open_time: str | None = None
     close_time: str | None = None
@@ -35,6 +42,27 @@ class KalshiMarket(BaseModel):
     settlement_value: int | None = None
 
     model_config = {"populate_by_name": True}
+
+    def spread_bps(self) -> int | None:
+        """Compute spread from listing data without needing orderbook call."""
+        try:
+            bid = float(self.yes_bid_dollars or 0)
+            ask = float(self.yes_ask_dollars or 0)
+            if bid > 0 and ask > 0:
+                return int((ask - bid) * 10000)
+        except (ValueError, TypeError):
+            pass
+        return None
+
+    def mid_price(self) -> float | None:
+        try:
+            bid = float(self.yes_bid_dollars or 0)
+            ask = float(self.yes_ask_dollars or 0)
+            if bid > 0 and ask > 0:
+                return (bid + ask) / 2
+        except (ValueError, TypeError):
+            pass
+        return None
 
 
 class KalshiOrderbook(BaseModel):

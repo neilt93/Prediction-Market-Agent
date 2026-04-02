@@ -504,25 +504,45 @@ class LiveTrader:
         self.safety.check_position_health()
 
     async def _run_cycle(self, kalshi, forecaster, calibrator, evidence, rule_parser):
-        # 1. Discover target markets
-        targets = []
+        # 1. Discover and PRE-FILTER using listing data (no orderbook calls needed)
+        all_niche = []
+        candidates = []
         try:
             async for event in kalshi.get_events(status="open", limit=200):
                 if not event.markets:
                     continue
                 for km in event.markets:
                     niche = classify_niche(km.title or event.title)
-                    if niche and km.status == "active":
-                        targets.append((event, km, niche))
+                    if not niche or km.status != "active":
+                        continue
+                    all_niche.append(km.ticker)
+
+                    # Pre-filter spread from listing data (no API call needed)
+                    listing_spread = km.spread_bps()
+                    if listing_spread is None or listing_spread > self.safety.config["max_spread_bps"]:
+                        continue
+
+                    # Pre-filter time to close
+                    time_to_close_hours = None
+                    if km.close_time:
+                        try:
+                            close_dt = datetime.fromisoformat(km.close_time.replace("Z", "+00:00"))
+                            time_to_close_hours = max(0, (close_dt - datetime.now(tz=timezone.utc)).total_seconds() / 3600)
+                        except (ValueError, TypeError):
+                            pass
+                    if time_to_close_hours is not None and (time_to_close_hours < 2 or time_to_close_hours > 24 * 30):
+                        continue
+
+                    candidates.append((event, km, niche, time_to_close_hours))
         except Exception as e:
             logger.error(f"Market discovery failed: {e}")
             self.safety.record_api_error()
             return
 
-        logger.info(f"  {len(targets)} target markets")
+        logger.info(f"  {len(all_niche)} niche markets, {len(candidates)} pass spread+time filter")
         trades_this_cycle = 0
 
-        for event, km, niche in targets:
+        for event, km, niche, time_to_close_hours in candidates:
             if self.safety.check_kill_switch():
                 break
             session_issue = self.safety.check_session_limits()
@@ -533,7 +553,7 @@ class LiveTrader:
             title = km.title or event.title
             ticker = km.ticker
 
-            # 2. Orderbook + spread
+            # 2. Fetch full orderbook only for candidates that passed pre-filter
             try:
                 ob = await kalshi.get_orderbook(ticker)
             except Exception:
@@ -552,15 +572,6 @@ class LiveTrader:
             if ticker in self.safety.open_tickers():
                 self.safety.mark_position(ticker, yes_mid_cents)
                 self.safety.check_position_health()
-
-            # Time to close
-            time_to_close_hours = None
-            if km.close_time:
-                try:
-                    close_dt = datetime.fromisoformat(km.close_time.replace("Z", "+00:00"))
-                    time_to_close_hours = max(0, (close_dt - datetime.now(tz=timezone.utc)).total_seconds() / 3600)
-                except (ValueError, TypeError):
-                    pass
 
             # 3. Parse + evidence + forecast
             parsed = rule_parser.parse(title, km.rules_primary)
