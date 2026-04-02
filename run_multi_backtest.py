@@ -111,9 +111,10 @@ async def run_one_pass(
     from schemas.models.postmortem import Postmortem
     from sqlalchemy import exists
 
+    settings = BaseAppSettings()
     rule_parser = RuleParser()
     calibrator = Calibrator(model_path=calibrator_model_path)
-    forecaster = Forecaster(api_url="http://localhost:11434/v1", model="llama3.1:8b")
+    forecaster = Forecaster(api_url=settings.llm_api_url, model=settings.llm_model)
     evidence_retriever = EvidenceRetriever()
     policy = ExecutionPolicy(PolicyConfig(
         min_edge_bps=300, min_confidence=0.3, max_spread_bps=15000,
@@ -185,7 +186,7 @@ async def run_one_pass(
 
         forecast = Forecast(
             market_id=market.id, ts=datetime.now(tz=timezone.utc),
-            model_name="llama3.1:8b",
+            model_name=settings.llm_model,
             raw_probability=Decimal(str(round(forecast_output.raw_probability, 6))),
             confidence=Decimal(str(round(forecast_output.confidence, 6))),
             abstain_flag=forecast_output.abstain,

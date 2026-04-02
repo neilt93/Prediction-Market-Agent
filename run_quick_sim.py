@@ -166,10 +166,10 @@ async def quick_forecast(session):
         daily_max_loss=50.0,
     ))
 
-    # Try to connect to a local LLM, fall back to mock forecasts
+    settings = BaseAppSettings()
     forecaster = Forecaster(
-        api_url="http://localhost:11434/v1",
-        model="llama3.1:8b",
+        api_url=settings.llm_api_url,
+        model=settings.llm_model,
     )
 
     # Forecast markets with snapshots, ordered by tightest spread
@@ -220,7 +220,7 @@ async def quick_forecast(session):
         forecast = Forecast(
             market_id=market.id,
             ts=datetime.now(tz=timezone.utc),
-            model_name="llama3.1:8b",
+            model_name=settings.llm_model,
             raw_probability=Decimal(str(round(forecast_output.raw_probability, 6))),
             confidence=Decimal(str(round(forecast_output.confidence, 6))),
             abstain_flag=forecast_output.abstain,

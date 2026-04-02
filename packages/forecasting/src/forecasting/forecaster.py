@@ -56,7 +56,7 @@ class Forecaster:
     def __init__(
         self,
         api_url: str = "http://localhost:11434/v1",
-        model: str = "llama3.1:8b",
+        model: str = "qwen2.5:14b",
         api_key: str = "ollama",
     ) -> None:
         self.api_url = api_url.rstrip("/")

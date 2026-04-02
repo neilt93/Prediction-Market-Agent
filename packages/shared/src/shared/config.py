@@ -18,6 +18,10 @@ class BaseAppSettings(BaseSettings):
     debug: bool = False
     log_level: str = "INFO"
 
+    # LLM
+    llm_api_url: str = "http://localhost:11434/v1"
+    llm_model: str = "qwen2.5:14b"
+
     # Kalshi
     kalshi_env: str = "demo"
     kalshi_api_key_id: str = ""

@@ -405,7 +405,7 @@ class LiveTrader:
             api_key_id=settings.kalshi_api_key_id,
             private_key_path=settings.kalshi_private_key_path,
         )
-        forecaster = Forecaster(api_url="http://localhost:11434/v1", model="llama3.1:8b")
+        forecaster = Forecaster(api_url=settings.llm_api_url, model=settings.llm_model)
         calibrator = Calibrator(model_path=str(MODEL_PATH) if MODEL_PATH.exists() else None)
         evidence = EvidenceRetriever()
         rule_parser = RuleParser()
