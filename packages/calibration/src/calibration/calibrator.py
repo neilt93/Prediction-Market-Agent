@@ -53,48 +53,73 @@ class Calibrator:
         if model_path and Path(model_path).exists():
             self.load(model_path)
 
-    def train(self, features_df: pd.DataFrame, labels: pd.Series) -> dict[str, float]:
-        """Train the calibrator on historical data.
+    def train(
+        self,
+        features_df: pd.DataFrame,
+        labels: pd.Series,
+        val_fraction: float = 0.2,
+    ) -> dict[str, float]:
+        """Train the calibrator on historical data with temporal validation.
 
         Args:
-            features_df: DataFrame with columns from FEATURE_COLUMNS + raw_probability
+            features_df: DataFrame with columns from FEATURE_COLUMNS + raw_probability.
+                         Rows must be in temporal order (oldest first).
             labels: Series of 0/1 resolved outcomes
+            val_fraction: Fraction of data to hold out for validation (from the end)
         """
+        from sklearn.metrics import brier_score_loss, log_loss
+
         available_cols = [c for c in FEATURE_COLUMNS if c in features_df.columns]
         X = features_df[available_cols].fillna(0).values
         y = labels.values
 
-        train_data = lgb.Dataset(X, label=y, feature_name=available_cols)
+        # Temporal train/val split (last val_fraction of data is validation)
+        n_val = max(1, int(len(y) * val_fraction))
+        n_train = len(y) - n_val
+        X_train, X_val = X[:n_train], X[n_train:]
+        y_train, y_val = y[:n_train], y[n_train:]
+
+        train_data = lgb.Dataset(X_train, label=y_train, feature_name=available_cols)
+        val_data = lgb.Dataset(X_val, label=y_val, feature_name=available_cols, reference=train_data)
 
         params = {
             "objective": "binary",
             "metric": "binary_logloss",
-            "num_leaves": 31,
+            "num_leaves": 7,
             "learning_rate": 0.05,
             "feature_fraction": 0.8,
             "bagging_fraction": 0.8,
             "bagging_freq": 5,
+            "min_data_in_leaf": 15,
+            "lambda_l2": 5.0,
             "verbose": -1,
         }
 
         self.model = lgb.train(
             params,
             train_data,
-            num_boost_round=200,
-            valid_sets=[train_data],
-            callbacks=[lgb.log_evaluation(period=50)],
+            num_boost_round=100,
+            valid_sets=[val_data],
+            callbacks=[
+                lgb.log_evaluation(period=25),
+                lgb.early_stopping(stopping_rounds=20),
+            ],
         )
 
-        # Compute training metrics
-        preds = self.model.predict(X)
-        from sklearn.metrics import brier_score_loss, log_loss
+        # Report validation metrics (not training metrics)
+        val_preds = self.model.predict(X_val)
+        train_preds = self.model.predict(X_train)
 
         metrics = {
-            "brier_score": float(brier_score_loss(y, preds)),
-            "log_loss": float(log_loss(y, preds)),
-            "n_samples": len(y),
+            "train_brier": float(brier_score_loss(y_train, train_preds)),
+            "val_brier": float(brier_score_loss(y_val, val_preds)),
+            "train_log_loss": float(log_loss(y_train, train_preds)),
+            "val_log_loss": float(log_loss(y_val, val_preds)),
+            "n_train": n_train,
+            "n_val": n_val,
+            "best_iteration": self.model.best_iteration,
         }
-        self.version = f"v1-lgb-{len(y)}samples"
+        self.version = f"v2-lgb-{len(y)}samples"
         logger.info("calibrator_trained", **metrics)
         return metrics
 
