@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 for pkg in ["shared", "schemas", "market_ingest", "rules", "forecasting",
-            "calibration", "execution", "training", "evidence"]:
+            "calibration", "execution", "training", "evidence", "diffusion"]:
     sys.path.insert(0, str(Path(__file__).parent / "packages" / pkg / "src"))
 
 from shared.config import BaseAppSettings
@@ -114,6 +114,18 @@ async def run_one_pass(
     settings = BaseAppSettings()
     rule_parser = RuleParser()
     calibrator = Calibrator(model_path=calibrator_model_path)
+
+    # Diffusion calibrator (runs alongside LightGBM)
+    diffusion_calibrator = None
+    try:
+        from diffusion.inference import DiffusionCalibrator
+        cfm_path = str(Path("data/models/cfm_latest.pt"))
+        if Path(cfm_path).exists():
+            diffusion_calibrator = DiffusionCalibrator(cfm_path)
+            logger.info(f"Diffusion calibrator loaded: {diffusion_calibrator.version}")
+    except Exception as e:
+        logger.warning(f"Diffusion calibrator not available: {e}")
+
     forecaster = Forecaster(api_url=settings.llm_api_url, model=settings.llm_model)
     evidence_retriever = EvidenceRetriever()
     policy = ExecutionPolicy(PolicyConfig(
@@ -221,6 +233,20 @@ async def run_one_pass(
             uncertainty_low=Decimal(str(round(cal.uncertainty_low, 6))),
             uncertainty_high=Decimal(str(round(cal.uncertainty_high, 6))),
         ))
+
+        # Diffusion calibrator (parallel prediction)
+        if diffusion_calibrator is not None:
+            try:
+                dcal = diffusion_calibrator.predict(features, market_price=market_price)
+                session.add(CalibratedForecast(
+                    forecast_id=forecast.id, calibrator_version=diffusion_calibrator.version,
+                    calibrated_probability=Decimal(str(round(dcal.calibrated_probability, 6))),
+                    predicted_edge_bps=dcal.predicted_edge_bps,
+                    uncertainty_low=Decimal(str(round(dcal.uncertainty_low, 6))),
+                    uncertainty_high=Decimal(str(round(dcal.uncertainty_high, 6))),
+                ))
+            except Exception as e:
+                logger.warning(f"Diffusion predict failed: {e}")
 
         label = outcome.resolved_label
         prob = forecast_output.raw_probability

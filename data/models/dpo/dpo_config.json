@@ -1,0 +1,17 @@
+{
+  "base_model": "Qwen/Qwen2.5-14B-Instruct",
+  "data_path": "data/dpo/preference_pairs.jsonl",
+  "output_dir": "data/models/dpo",
+  "lora_r": 16,
+  "lora_alpha": 32,
+  "lora_dropout": 0.05,
+  "quantization": "4bit",
+  "learning_rate": 5e-05,
+  "num_train_epochs": 3,
+  "per_device_train_batch_size": 1,
+  "gradient_accumulation_steps": 8,
+  "max_length": 1024,
+  "max_prompt_length": 512,
+  "beta": 0.1,
+  "fp16": true
+}

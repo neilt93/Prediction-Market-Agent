@@ -395,6 +395,7 @@ class LiveTrader:
         from forecasting.forecaster import Forecaster
         from calibration.router import CalibratorRouter
         from calibration.ece import compute_ece_from_db
+        from diffusion.inference import DiffusionCalibrator
         from evidence.retriever import EvidenceRetriever
         from rules.parser import RuleParser
         from training.context_collector import FrozenContextCollector
@@ -414,7 +415,18 @@ class LiveTrader:
             api_url=settings.llm_api_url, model=settings.llm_model,
             enable_decomposition=True, enable_debate=True,
         )
-        calibrator = CalibratorRouter()  # Niche-routed calibrators
+        calibrator = CalibratorRouter()  # Niche-routed LightGBM calibrators
+
+        # CFM calibrator (2x better Brier than LightGBM) — use as primary if available
+        cfm_path = Path("data/models/cfm_latest.pt")
+        cfm_calibrator = None
+        if cfm_path.exists():
+            try:
+                cfm_calibrator = DiffusionCalibrator(str(cfm_path))
+                logger.info(f"  CFM calibrator loaded: {cfm_calibrator.version}")
+            except Exception as e:
+                logger.warning(f"  CFM calibrator failed to load: {e}")
+
         evidence = EvidenceRetriever()
         rule_parser = RuleParser()
 
@@ -631,7 +643,7 @@ class LiveTrader:
                                     "reason": "model_abstained", "niche": niche})
                 continue
 
-            # 4. Calibrate with niche-routed model
+            # 4. Calibrate — CFM primary (0.043 Brier), LightGBM fallback (0.081)
             features = {
                 "market_price": mid, "spread_bps": spread_bps,
                 "ambiguity_score": parsed.ambiguity_score,
@@ -639,7 +651,13 @@ class LiveTrader:
                 "retrieval_count": len(flat_snippets),
                 "raw_probability": forecast_output.raw_probability,
             }
-            cal = calibrator.predict(features, market_price=mid, niche=niche)
+            # Use CFM if available (2x better), else LightGBM router
+            if cfm_calibrator is not None:
+                cal = cfm_calibrator.predict(features, market_price=mid)
+                cal_source = "cfm"
+            else:
+                cal = calibrator.predict(features, market_price=mid, niche=niche)
+                cal_source = "lgbm"
             edge_bps = int((cal.calibrated_probability - mid) * 10000)
 
             # 5. Dynamic ECE threshold: only trade when edge > niche ECE

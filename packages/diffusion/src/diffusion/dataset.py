@@ -1,7 +1,7 @@
 """Dataset construction from the prediction market database."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -26,6 +26,13 @@ FEATURE_COLUMNS = [
     "raw_probability",
 ]
 
+# Features already on [0,1] scale that should NOT be z-score normalized.
+# These are the dominant predictive signals and normalizing them washes out
+# the direct correspondence between input and output probability space.
+PASSTHROUGH_FEATURES = {"market_price", "raw_probability", "llm_confidence",
+                        "ambiguity_score", "freshness_score", "source_agreement_score",
+                        "official_source_present"}
+
 
 @dataclass
 class DatasetStats:
@@ -34,9 +41,14 @@ class DatasetStats:
     mean: np.ndarray
     std: np.ndarray
     feature_names: list[str]
+    passthrough_mask: np.ndarray = field(default_factory=lambda: np.array([]))
 
     def save(self, path: str) -> None:
-        np.savez(path, mean=self.mean, std=self.std, feature_names=self.feature_names)
+        np.savez(
+            path, mean=self.mean, std=self.std,
+            feature_names=self.feature_names,
+            passthrough_mask=self.passthrough_mask,
+        )
 
     @classmethod
     def load(cls, path: str) -> DatasetStats:
@@ -45,14 +57,15 @@ class DatasetStats:
             mean=data["mean"],
             std=data["std"],
             feature_names=list(data["feature_names"]),
+            passthrough_mask=data.get("passthrough_mask", np.array([])),
         )
 
 
 class ForecastDataset(Dataset):
     """PyTorch dataset of (features, label) pairs from resolved markets.
 
-    Loads data from a pandas DataFrame (extracted from DB by the trainer).
-    Handles normalization and logit transformation.
+    Features on [0,1] scale (market_price, raw_probability, etc.) are passed
+    through without normalization. Other features are z-score normalized.
     """
 
     def __init__(
@@ -67,26 +80,35 @@ class ForecastDataset(Dataset):
         X = features_df[available_cols].fillna(0).values.astype(np.float32)
         y = labels.values.astype(np.float32)
 
-        # Compute or apply normalization
+        # Build passthrough mask: True for features that skip normalization
+        passthrough = np.array([c in PASSTHROUGH_FEATURES for c in available_cols])
+
         if stats is None:
             self.stats = DatasetStats(
                 mean=X.mean(axis=0),
                 std=X.std(axis=0) + 1e-8,
                 feature_names=available_cols,
+                passthrough_mask=passthrough,
             )
         else:
             self.stats = stats
+            passthrough = stats.passthrough_mask
 
-        X = (X - self.stats.mean) / self.stats.std
+        # Selective normalization: only z-score non-passthrough features
+        X_norm = X.copy()
+        normalize_mask = ~passthrough
+        if normalize_mask.any():
+            X_norm[:, normalize_mask] = (
+                (X[:, normalize_mask] - self.stats.mean[normalize_mask])
+                / self.stats.std[normalize_mask]
+            )
 
-        # Label smoothing: 0 -> label_smoothing, 1 -> 1 - label_smoothing
+        # Label smoothing: 0 -> eps, 1 -> 1-eps
         y_smooth = y * (1.0 - 2 * label_smoothing) + label_smoothing
-
-        # Transform to logit space
         y_logit = np.log(y_smooth / (1.0 - y_smooth))
 
-        self.features = torch.tensor(X, device=device)
-        self.targets = torch.tensor(y_logit, device=device).unsqueeze(-1)  # (N, 1)
+        self.features = torch.tensor(X_norm, device=device)
+        self.targets = torch.tensor(y_logit, device=device).unsqueeze(-1)
         self.labels_raw = torch.tensor(y, device=device)
 
     def __len__(self) -> int:
@@ -99,12 +121,11 @@ class ForecastDataset(Dataset):
 def build_dataset_from_db(
     db_session: Any,
     market_ids: set | None = None,
-) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
-    """Extract features, labels, and close_times from the database.
+) -> tuple[pd.DataFrame, pd.Series, pd.Series, list[str]]:
+    """Extract features, labels, close_times, and titles from the database.
 
     Returns data sorted by close_time (temporal ordering).
     """
-    from sqlalchemy import func
     from schemas.models.forecast import Forecast, ForecastFeature
     from schemas.models.market import Market, MarketOutcome
 
@@ -114,6 +135,7 @@ def build_dataset_from_db(
             Forecast.raw_probability,
             MarketOutcome.resolved_label,
             Market.close_time,
+            Market.title,
         )
         .join(Forecast, ForecastFeature.forecast_id == Forecast.id)
         .join(MarketOutcome, Forecast.market_id == MarketOutcome.market_id)
@@ -126,12 +148,13 @@ def build_dataset_from_db(
 
     results = query.all()
     if not results:
-        return pd.DataFrame(), pd.Series(dtype=float), pd.Series(dtype="datetime64[ns]")
+        return pd.DataFrame(), pd.Series(dtype=float), pd.Series(dtype="datetime64[ns]"), []
 
     rows = []
     labels = []
     close_times = []
-    for feature, raw_prob, label, close_time in results:
+    titles = []
+    for feature, raw_prob, label, close_time, title in results:
         row = {
             "market_price": float(feature.market_price or 0),
             "spread_bps": feature.spread_bps or 0,
@@ -150,11 +173,13 @@ def build_dataset_from_db(
         rows.append(row)
         labels.append(label)
         close_times.append(close_time)
+        titles.append(title or "")
 
     return (
         pd.DataFrame(rows),
         pd.Series(labels, dtype=float),
-        pd.Series(close_times, dtype="datetime64[ns]"),
+        pd.Series(close_times).dt.tz_localize(None),
+        titles,
     )
 
 
@@ -167,13 +192,9 @@ def temporal_cv_splits(
 
     Data must already be sorted by time. Each fold uses all prior data
     for training and the next chunk for validation.
-
-    Returns:
-        List of (train_indices, val_indices) tuples
     """
     fold_size = (n_samples - min_train_size) // n_folds
     if fold_size < 5:
-        # Too few samples for CV -- use a single 80/20 split
         split = int(n_samples * 0.8)
         return [(np.arange(split), np.arange(split, n_samples))]
 
@@ -193,48 +214,59 @@ def temporal_cv_splits(
 def augment_with_counterfactuals(
     features_df: pd.DataFrame,
     labels: pd.Series,
-    noise_scale: float = 0.1,
+    noise_scale: float = 0.05,
     n_augmented: int = 3,
     rng: np.random.Generator | None = None,
 ) -> tuple[pd.DataFrame, pd.Series]:
-    """Create counterfactual augmented training data.
+    """Create augmented training data with smart counterfactuals.
 
-    For each sample, creates n_augmented copies with:
-    - Small Gaussian noise on numerical features
-    - Flipped labels with correspondingly perturbed raw_probability
-      (simulates a world where the outcome was different)
-
-    This forces the model to learn from feature patterns rather than
-    memorizing market-outcome correlations.
+    Improvements over v1:
+    - Only flips labels on uncertain markets (market_price between 0.2 and 0.8)
+    - When flipping, also flips market_price (1 - price) for consistency
+    - Reduces noise scale to avoid destroying signal
+    - Non-flipped augmentations just add small noise (keeps label)
     """
     if rng is None:
         rng = np.random.default_rng(42)
 
+    cols = list(features_df.columns)
+    mp_idx = cols.index("market_price") if "market_price" in cols else -1
+    rp_idx = cols.index("raw_probability") if "raw_probability" in cols else -1
+
     augmented_rows = []
     augmented_labels = []
 
+    # Compute stds only for non-passthrough features
     feature_stds = features_df.std().fillna(0).values
 
     for i in range(len(features_df)):
         row = features_df.iloc[i].values.astype(np.float32)
         label = labels.iloc[i]
+        market_price = row[mp_idx] if mp_idx >= 0 else 0.5
 
         for _ in range(n_augmented):
-            # Add noise to features
-            noise = rng.normal(0, noise_scale, size=row.shape) * feature_stds
-            new_row = row + noise.astype(np.float32)
+            new_row = row.copy()
 
-            # Half the augmentations flip the label (counterfactual)
-            if rng.random() < 0.5:
+            # Add small noise to non-probability features
+            noise = rng.normal(0, noise_scale, size=row.shape) * feature_stds
+            new_row += noise.astype(np.float32)
+
+            # Only flip labels on uncertain markets (price between 0.2-0.8)
+            is_uncertain = 0.2 < market_price < 0.8
+            if is_uncertain and rng.random() < 0.4:
                 new_label = 1.0 - label
-                # Perturb raw_probability toward the flipped label
-                raw_prob_idx = list(features_df.columns).index("raw_probability") if "raw_probability" in features_df.columns else -1
-                if raw_prob_idx >= 0:
-                    new_row[raw_prob_idx] = np.clip(
-                        1.0 - new_row[raw_prob_idx] + rng.normal(0, 0.1), 0.01, 0.99
-                    )
+                # Flip the probability features to match
+                if mp_idx >= 0:
+                    new_row[mp_idx] = np.clip(1.0 - market_price + rng.normal(0, 0.05), 0.01, 0.99)
+                if rp_idx >= 0:
+                    new_row[rp_idx] = np.clip(1.0 - row[rp_idx] + rng.normal(0, 0.05), 0.01, 0.99)
             else:
                 new_label = label
+                # Keep probability features close to original
+                if mp_idx >= 0:
+                    new_row[mp_idx] = np.clip(row[mp_idx] + rng.normal(0, 0.02), 0.01, 0.99)
+                if rp_idx >= 0:
+                    new_row[rp_idx] = np.clip(row[rp_idx] + rng.normal(0, 0.02), 0.01, 0.99)
 
             augmented_rows.append(new_row)
             augmented_labels.append(new_label)
@@ -242,7 +274,6 @@ def augment_with_counterfactuals(
     aug_df = pd.DataFrame(augmented_rows, columns=features_df.columns)
     aug_labels = pd.Series(augmented_labels, dtype=float)
 
-    # Concatenate original + augmented
     combined_df = pd.concat([features_df, aug_df], ignore_index=True)
     combined_labels = pd.concat([labels, aug_labels], ignore_index=True)
 

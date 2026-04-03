@@ -3,12 +3,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import torch
 
-from diffusion.dataset import DatasetStats, FEATURE_COLUMNS
+from diffusion.dataset import DatasetStats, FEATURE_COLUMNS, PASSTHROUGH_FEATURES
 from diffusion.flow_matching import ConditionalFlowMatcher, CFMConfig
 from diffusion.model import DenoisingMLP
 
@@ -30,11 +29,12 @@ class CalibratedOutput:
 
 
 class DiffusionCalibrator:
-    """Flow-matching calibrator with the same interface as the LightGBM Calibrator.
+    """Flow-matching calibrator with market-price-informed prior.
 
-    Produces calibrated probabilities by sampling from a learned
-    conditional distribution, giving both point estimates and
-    uncertainty bounds.
+    Uses Conditional Flow Matching to produce calibrated probability
+    distributions. Starts the ODE from logit(market_price) rather than
+    pure noise, so the model refines the market rather than discovering
+    the answer from scratch.
     """
 
     def __init__(
@@ -66,7 +66,6 @@ class DiffusionCalibrator:
             CalibratedOutput with calibrated_probability, edge, uncertainty
         """
         if self.model is None or self.stats is None:
-            # Fallback: return raw probability with wide uncertainty
             raw = features.get("raw_probability", 0.5)
             return CalibratedOutput(
                 calibrated_probability=raw,
@@ -75,21 +74,26 @@ class DiffusionCalibrator:
                 uncertainty_high=min(1, raw + 0.15),
             )
 
-        # Build feature vector in the same order as training
+        # Build feature vector with selective normalization
         x = np.array(
             [features.get(c, 0.0) for c in self.stats.feature_names],
             dtype=np.float32,
         )
-        # Normalize using training stats
-        x = (x - self.stats.mean) / self.stats.std
-        feat_tensor = torch.tensor(x, device=self.device).unsqueeze(0)  # (1, F)
+        # Only normalize non-passthrough features
+        if len(self.stats.passthrough_mask) > 0:
+            norm_mask = ~self.stats.passthrough_mask
+            if norm_mask.any():
+                x[norm_mask] = (x[norm_mask] - self.stats.mean[norm_mask]) / self.stats.std[norm_mask]
+        else:
+            x = (x - self.stats.mean) / self.stats.std
 
-        # Sample from the flow model
-        logit_samples = self.cfm.sample(feat_tensor, n_samples=32)  # (1, 32, 1)
-        prob_samples = torch.sigmoid(logit_samples).squeeze(-1).squeeze(0)  # (32,)
+        feat_tensor = torch.tensor(x, device=self.device).unsqueeze(0)
+
+        # Sample from the flow model (uses market-price prior automatically)
+        logit_samples = self.cfm.sample(feat_tensor, n_samples=32)
+        prob_samples = torch.sigmoid(logit_samples).squeeze(-1).squeeze(0)
         prob_samples = prob_samples.cpu().numpy()
 
-        # Aggregate
         prob = float(np.mean(prob_samples))
         prob = max(0.01, min(0.99, prob))
         p10 = float(np.percentile(prob_samples, 10))
@@ -107,25 +111,18 @@ class DiffusionCalibrator:
         )
 
     def save(self, path: str) -> None:
-        """Save model weights, config, and normalization stats."""
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-
         if self.model is not None:
             torch.save(self.model.state_dict(), str(p))
-
         if self.stats is not None:
             self.stats.save(str(p.with_suffix(".stats.npz")))
-
         meta = {"version": self.version, "device": self.device}
         with open(str(p.with_suffix(".meta.json")), "w") as f:
             json.dump(meta, f)
 
     def load(self, path: str) -> None:
-        """Load a saved model."""
         p = Path(path)
-
-        # Load stats first to know feature count
         stats_path = p.with_suffix(".stats.npz")
         if stats_path.exists():
             self.stats = DatasetStats.load(str(stats_path))
@@ -134,13 +131,11 @@ class DiffusionCalibrator:
 
         feature_dim = len(self.stats.feature_names)
         self.model = DenoisingMLP(
-            target_dim=1,
-            feature_dim=feature_dim,
+            target_dim=1, feature_dim=feature_dim,
         ).to(self.device)
         self.model.load_state_dict(torch.load(str(p), map_location=self.device, weights_only=True))
         self.model.eval()
-
-        self.cfm = ConditionalFlowMatcher(self.model, CFMConfig())
+        self.cfm = ConditionalFlowMatcher(self.model, CFMConfig(use_market_prior=True))
 
         meta_path = p.with_suffix(".meta.json")
         if meta_path.exists():

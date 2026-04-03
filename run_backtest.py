@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 for pkg in ["shared", "schemas", "market_ingest", "rules", "forecasting",
-            "calibration", "execution", "training", "evidence"]:
+            "calibration", "execution", "training", "evidence", "diffusion"]:
     sys.path.insert(0, str(Path(__file__).parent / "packages" / pkg / "src"))
 
 from shared.config import BaseAppSettings

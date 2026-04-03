@@ -18,20 +18,52 @@ class CFMConfig:
     label_smoothing: float = 0.025  # labels become 0.025 and 0.975
     n_inference_samples: int = 32
     n_ode_steps: int = 5
-    sigma_min: float = 1e-4  # small noise floor to avoid exact interpolation at t=1
+    sigma_min: float = 1e-4
+    use_market_prior: bool = True  # start ODE from market price, not pure noise
+    market_price_feature_idx: int = 0  # index of market_price in feature vector
+
+
+def _market_prior_sigma(market_price: torch.Tensor) -> torch.Tensor:
+    """Compute noise scale for market-price-informed prior.
+
+    When price is extreme (near 0 or 1), sigma is small -- we trust the market.
+    When price is near 0.5, sigma is large -- uncertain, let the model work.
+
+    sigma = 4 * p * (1 - p), peaks at 1.0 when p=0.5, ~0 at extremes.
+    """
+    p = market_price.clamp(0.01, 0.99)
+    return 4.0 * p * (1.0 - p)
 
 
 class ConditionalFlowMatcher:
     """Optimal-transport Conditional Flow Matching trainer.
 
-    The flow interpolates between Gaussian noise (t=0) and the target (t=1)
-    via straight-line paths: x_t = (1 - t) * x_0 + t * x_1.
-    The model learns the velocity field v(x_t, t, c) = x_1 - x_0.
+    With market-price prior: the flow starts from logit(market_price) + noise
+    instead of pure N(0,1). This means the model learns to *refine* the market
+    price rather than discover the answer from scratch.
     """
 
     def __init__(self, model: nn.Module, config: CFMConfig | None = None) -> None:
         self.model = model
         self.config = config or CFMConfig()
+
+    def _sample_prior(
+        self, shape: tuple, features: torch.Tensor, device: torch.device,
+    ) -> torch.Tensor:
+        """Sample from the source distribution (t=0).
+
+        If use_market_prior: N(logit(market_price), sigma(market_price))
+        Otherwise: N(0, 1)
+        """
+        if self.config.use_market_prior and features.shape[-1] > self.config.market_price_feature_idx:
+            # Extract market_price from features (it's a passthrough feature, not normalized)
+            mp = features[:, self.config.market_price_feature_idx].clamp(0.01, 0.99)
+            mu = logit(mp).unsqueeze(-1)  # (B, 1)
+            sigma = _market_prior_sigma(mp).unsqueeze(-1)  # (B, 1)
+            # Ensure sigma has a floor so we still explore
+            sigma = sigma.clamp(min=0.1)
+            return mu + sigma * torch.randn(shape, device=device)
+        return torch.randn(shape, device=device)
 
     def compute_loss(
         self,
@@ -50,21 +82,20 @@ class ConditionalFlowMatcher:
         B, D = x_1.shape
         device = x_1.device
 
-        # Sample noise and time
-        x_0 = torch.randn_like(x_1)
+        # Sample from source distribution and time
+        x_0 = self._sample_prior((B, D), features, device)
         t = torch.rand(B, device=device)
 
         # Straight-line interpolation: x_t = (1-t)*x_0 + t*x_1
-        t_expand = t.unsqueeze(-1)  # (B, 1)
+        t_expand = t.unsqueeze(-1)
         x_t = (1.0 - t_expand) * x_0 + t_expand * x_1
 
-        # Target velocity is the direction from noise to data
+        # Target velocity: direction from source to target
         target_v = x_1 - x_0
 
         # Predict velocity
         pred_v = self.model(x_t, t, features)
 
-        # MSE loss on velocity
         return torch.mean((pred_v - target_v) ** 2)
 
     def train_epoch(
@@ -73,11 +104,7 @@ class ConditionalFlowMatcher:
         features: torch.Tensor,
         optimizer: torch.optim.Optimizer,
     ) -> float:
-        """Run one training epoch (full-batch for small datasets).
-
-        Returns:
-            epoch loss (float)
-        """
+        """Run one training epoch (full-batch for small datasets)."""
         self.model.train()
         optimizer.zero_grad()
         loss = self.compute_loss(x_1, features)
@@ -97,8 +124,8 @@ class ConditionalFlowMatcher:
 
         Args:
             features: conditioning features, shape (B, F) or (F,)
-            n_samples: number of noise samples per input (default from config)
-            n_steps: number of Euler steps (default from config)
+            n_samples: number of noise samples per input
+            n_steps: number of Euler steps
 
         Returns:
             sampled logits, shape (B, n_samples, D) or (n_samples, D)
@@ -112,14 +139,13 @@ class ConditionalFlowMatcher:
             features = features.unsqueeze(0)
 
         B, F = features.shape
-        D = 1  # target dimensionality (1D logit for MVE)
+        D = 1
 
-        # Repeat features for n_samples
-        # (B, F) -> (B * n_samples, F)
+        # Expand features for n_samples
         feat_expanded = features.unsqueeze(1).expand(B, n_samples, F).reshape(B * n_samples, F)
 
-        # Start from noise
-        z = torch.randn(B * n_samples, D, device=features.device)
+        # Start from market-price-informed prior (or pure noise)
+        z = self._sample_prior((B * n_samples, D), feat_expanded, features.device)
 
         # Euler integration from t=0 to t=1
         dt = 1.0 / n_steps
@@ -129,12 +155,9 @@ class ConditionalFlowMatcher:
             v = self.model(z, t, feat_expanded)
             z = z + dt * v
 
-        # Reshape: (B * n_samples, D) -> (B, n_samples, D)
         z = z.view(B, n_samples, D)
-
         if squeeze:
             z = z.squeeze(0)
-
         return z
 
 
@@ -152,16 +175,6 @@ class ODESolver:
         features: torch.Tensor,
         return_trajectory: bool = False,
     ) -> torch.Tensor | list[torch.Tensor]:
-        """Integrate the ODE from t=0 to t=1.
-
-        Args:
-            z_0: initial noise, shape (B, D)
-            features: conditioning, shape (B, F)
-            return_trajectory: if True, return list of all intermediate states
-
-        Returns:
-            final state (B, D) or list of states [(B, D), ...]
-        """
         self.model.eval()
         dt = 1.0 / self.n_steps
         z = z_0
