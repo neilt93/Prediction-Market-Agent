@@ -9,7 +9,22 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from calibration.calibrator import FEATURE_COLUMNS
+# Duplicated from calibration.calibrator to avoid hard dependency on lightgbm
+FEATURE_COLUMNS = [
+    "market_price",
+    "spread_bps",
+    "vol_24h",
+    "time_to_close_sec",
+    "ambiguity_score",
+    "freshness_score",
+    "source_agreement_score",
+    "official_source_present",
+    "llm_confidence",
+    "retrieval_count",
+    "price_momentum_1h",
+    "price_momentum_24h",
+    "raw_probability",
+]
 
 
 @dataclass

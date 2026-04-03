@@ -217,12 +217,14 @@ class SafetyState:
         time_to_close_hours: float | None,
         niche: str,
         event_ticker: str,
+        min_edge_override: int | None = None,
     ) -> str | None:
         """Return rejection reason, or None if trade passes all gates."""
 
-        # Edge threshold: > 5% (500 bps)
-        if abs(edge_bps) < self.config["min_edge_bps"]:
-            return f"Edge {abs(edge_bps)}bps < {self.config['min_edge_bps']}bps"
+        # Edge threshold: dynamic ECE-based or fixed minimum
+        min_edge = min_edge_override or self.config["min_edge_bps"]
+        if abs(edge_bps) < min_edge:
+            return f"Edge {abs(edge_bps)}bps < {min_edge}bps (ECE-adjusted)"
 
         # Confidence floor
         if confidence < self.config["min_confidence"]:
@@ -391,11 +393,14 @@ class LiveTrader:
         from market_ingest.clients.kalshi.client import KalshiClient
         from market_ingest.clients.kalshi.config import KalshiEnvironment
         from forecasting.forecaster import Forecaster
-        from calibration.calibrator import Calibrator
+        from calibration.router import CalibratorRouter
+        from calibration.ece import compute_ece_from_db
         from evidence.retriever import EvidenceRetriever
         from rules.parser import RuleParser
+        from training.context_collector import FrozenContextCollector
         import httpx as _httpx
         from market_ingest.clients.kalshi.auth import KalshiAuthenticator
+        from shared.db import create_sync_engine, create_sync_session_factory
 
         setup_logging(log_level="INFO")
         settings = BaseAppSettings()
@@ -405,10 +410,29 @@ class LiveTrader:
             api_key_id=settings.kalshi_api_key_id,
             private_key_path=settings.kalshi_private_key_path,
         )
-        forecaster = Forecaster(api_url=settings.llm_api_url, model=settings.llm_model)
-        calibrator = Calibrator(model_path=str(MODEL_PATH) if MODEL_PATH.exists() else None)
+        forecaster = Forecaster(
+            api_url=settings.llm_api_url, model=settings.llm_model,
+            enable_decomposition=True, enable_debate=True,
+        )
+        calibrator = CalibratorRouter()  # Niche-routed calibrators
         evidence = EvidenceRetriever()
         rule_parser = RuleParser()
+
+        # Compute dynamic ECE threshold from postmortem data
+        db_engine = create_sync_engine(settings.database_url_sync)
+        db_session = create_sync_session_factory(db_engine)()
+        try:
+            ece_map = compute_ece_from_db(db_session)
+            self._ece_overall = ece_map.get("overall", 0.10)
+            self._ece_by_niche = ece_map
+            logger.info(f"  ECE thresholds: {ece_map}")
+        finally:
+            db_session.close()
+
+        # Context collector for DPO training data
+        self._context_collector = FrozenContextCollector(
+            create_sync_session_factory(db_engine)()
+        )
 
         # Direct auth for balance checks
         _auth = KalshiAuthenticator.from_key_file(settings.kalshi_api_key_id, settings.kalshi_private_key_path)
@@ -573,15 +597,31 @@ class LiveTrader:
                 self.safety.mark_position(ticker, yes_mid_cents)
                 self.safety.check_position_health()
 
-            # 3. Parse + evidence + forecast
+            # 3. Parse rules + decompose + gather evidence per sub-question
             parsed = rule_parser.parse(title, km.rules_primary)
-            bundle = await evidence.gather(title, parsed.entity)
+
+            sub_q_evidence: dict[str, list[str]] | None = None
+            flat_snippets: list[str] = []
+
+            if forecaster.enable_decomposition:
+                sub_questions = await forecaster.decompose(title)
+                if sub_questions:
+                    sub_q_evidence = {}
+                    for sq in sub_questions:
+                        sq_bundle = await evidence.gather(sq, parsed.entity)
+                        sub_q_evidence[sq] = sq_bundle.top_snippets(3)
+                        flat_snippets.extend(sq_bundle.top_snippets(3))
+
+            if not flat_snippets:
+                bundle = await evidence.gather(title, parsed.entity)
+                flat_snippets = bundle.top_snippets(8)
 
             forecast_output = await forecaster.forecast(
                 title=title,
                 rules_text=km.rules_primary,
                 parsed_rules=parsed.model_dump(),
-                evidence_snippets=bundle.top_snippets(8),
+                evidence_snippets=flat_snippets,
+                sub_question_evidence=sub_q_evidence,
                 market_price=mid,
                 time_to_close_hours=time_to_close_hours,
             )
@@ -591,23 +631,31 @@ class LiveTrader:
                                     "reason": "model_abstained", "niche": niche})
                 continue
 
-            # 4. Calibrate
+            # 4. Calibrate with niche-routed model
             features = {
                 "market_price": mid, "spread_bps": spread_bps,
                 "ambiguity_score": parsed.ambiguity_score,
                 "llm_confidence": forecast_output.confidence,
-                "retrieval_count": bundle.count,
+                "retrieval_count": len(flat_snippets),
                 "raw_probability": forecast_output.raw_probability,
             }
-            cal = calibrator.predict(features, market_price=mid)
+            cal = calibrator.predict(features, market_price=mid, niche=niche)
             edge_bps = int((cal.calibrated_probability - mid) * 10000)
 
-            # 5. Pre-trade safety checks
+            # 5. Dynamic ECE threshold: only trade when edge > niche ECE
+            niche_ece = self._ece_by_niche.get(niche, self._ece_overall)
+            min_edge_bps = max(
+                self.safety.config["min_edge_bps"],
+                int(niche_ece * 10000),  # ECE in bps
+            )
+
+            # Pre-trade safety checks (with dynamic edge threshold)
             rejection = self.safety.check_pre_trade(
                 ticker=ticker, edge_bps=edge_bps, confidence=forecast_output.confidence,
                 ambiguity=parsed.ambiguity_score, spread_bps=spread_bps,
                 time_to_close_hours=time_to_close_hours, niche=niche,
                 event_ticker=event.event_ticker,
+                min_edge_override=min_edge_bps,
             )
 
             if rejection:
@@ -617,8 +665,12 @@ class LiveTrader:
                     "forecast": forecast_output.raw_probability,
                     "calibrated": cal.calibrated_probability,
                     "market_price": mid, "edge_bps": edge_bps,
+                    "min_edge_bps": min_edge_bps,
+                    "niche_ece": niche_ece,
                     "confidence": forecast_output.confidence,
-                    "evidence_count": bundle.count,
+                    "evidence_count": len(flat_snippets),
+                    "decomposition": forecast_output.decomposition_used,
+                    "debate": forecast_output.debate_used,
                 })
                 continue
 
@@ -640,17 +692,23 @@ class LiveTrader:
                 "calibrated": round(cal.calibrated_probability, 4),
                 "market_price": round(mid, 4),
                 "edge_bps": abs(edge_bps),
+                "min_edge_bps": min_edge_bps,
+                "niche_ece": round(niche_ece, 4),
                 "confidence": round(forecast_output.confidence, 4),
                 "spread_bps": spread_bps,
-                "evidence_count": bundle.count,
+                "evidence_count": len(flat_snippets),
+                "decomposition": forecast_output.decomposition_used,
+                "debate": forecast_output.debate_used,
                 "reasoning": forecast_output.reasoning_summary[:200],
             }
 
+            decomp_tag = " [D]" if forecast_output.decomposition_used else ""
+            debate_tag = " [R]" if forecast_output.debate_used else ""
             prefix = "[DRY]" if self.dry_run else "[LIVE]"
             logger.info(
                 f"  {prefix} BUY {side.upper()} {ticker} @ {limit_price_cents}c | "
-                f"edge={abs(edge_bps)}bps conf={forecast_output.confidence:.2f} "
-                f"[{niche}] {title[:35]}"
+                f"edge={abs(edge_bps)}bps>{min_edge_bps} conf={forecast_output.confidence:.2f} "
+                f"[{niche}] {title[:30]}{decomp_tag}{debate_tag}"
             )
 
             if not self.dry_run:
